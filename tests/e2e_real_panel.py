@@ -175,7 +175,7 @@ def main(binary):
         _, out = quiet(xm.op_list)
         check("list flags the direct + tunnel client", f"inbound #{tun}: 1 client(s) are also on" in out, out)
         row = next((line for line in out.splitlines() if "Germany Tunnel" in line), "")
-        check("list shows clients and multiplier", "3/3" in row and "x1.2" in row, row)
+        check("list shows clients and multiplier", "3/3" in row and "[1.20x]" in row, row)
 
         print("clients added later")
         p.add_client("e", [tun])

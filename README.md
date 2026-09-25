@@ -5,8 +5,8 @@ Daemon & CLI tool for inbound traffic multipliers and tunnel overhead compensati
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/)
 [![3X-UI v3.8.5](https://img.shields.io/badge/3X--UI-v3.8.5-2ea44f.svg)](https://github.com/MHSanaei/3x-ui/releases/tag/v3.8.5)
-![Version v2.0.0](https://img.shields.io/badge/version-v2.0.0-informational.svg)
-[![Tests 25/25 passing](https://img.shields.io/badge/tests-25%2F25%20passing-brightgreen.svg)](#verification--tests)
+![Version v2.1.0](https://img.shields.io/badge/version-v2.1.0-informational.svg)
+[![Tests 30/30 passing](https://img.shields.io/badge/tests-30%2F30%20passing-brightgreen.svg)](#verification--tests)
 
 **English** · [فارسی](#فارسی)
 
@@ -85,7 +85,11 @@ For exact per-inbound billing, keep tunnel users on tunnel inbounds only.
 
 ## Features
 - **Inbound-centric:** the multiplier belongs to the inbound; clients are discovered automatically.
-- **Minimal menu:** run `xui-mult`, like the native `x-ui` script. Four options.
+- **Minimal menu:** run `xui-mult`, like the native `x-ui` script. Four options on a dashboard card that
+  shows the service state, the multiplied inbounds and the extra billed.
+- **Aligned tables:** columns are measured in terminal cells, not characters, so flag emoji (🇩🇪),
+  Persian remarks (including the zero-width نیم‌فاصله) and CJK text stay aligned. On narrow screens,
+  like phone SSH apps, long columns are shortened with … instead of wrapping.
 - **Five scriptable subcommands:** `set`, `list`, `remove`, `status`, `logs`. `status` exits with
   code 1 on problems, for monitoring.
 - **No panel changes, no API token:** it adds one table (`xui_mult_ledger`) to `x-ui.db`. That's all.
@@ -115,28 +119,35 @@ cp /etc/x-ui/x-ui.db /root/x-ui.db.bak
 bash <(curl -Ls https://raw.githubusercontent.com/mahdizo3181/-3x-ui-multiplier/main/dist/install.sh)
 ```
 
-The installer lists your inbounds. Give the tunnel inbound its multiplier and watch a few ticks:
+When it finishes, the installer opens the menu. Choose **1**, pick the tunnel inbound and enter the
+multiplier. Or do the same from the shell:
 
 ```bash
 xui-mult set 2 1.2
 xui-mult logs -f
 ```
 
-Running the installer again upgrades in place and keeps your settings.
+Running the installer again upgrades in place and keeps your settings. For unattended installs
+(Ansible, CI) the menu is skipped automatically; `XUI_MULT_NO_MENU=1` skips it anywhere.
 
 ## CLI usage
 
-Running `xui-mult` with no arguments opens the menu:
+Running `xui-mult` with no arguments opens the dashboard:
 
 ```text
- xui-mult v2.0.0 — inbound traffic multipliers for 3X-UI
- Service: ● running   Multiplied inbounds: 2   Last tick: 3s ago
- ──────────────────────────────────────────────────────────
-  1) Set / edit multiplier for an inbound
-  2) List inbounds & multipliers
-  3) Remove multiplier from an inbound
-  4) Service status & logs
-  0) Exit
+╭─ xui-mult v2.1.0 ────────────────────────────────────────────────────────╮
+│ Inbound traffic multipliers for 3X-UI                                    │
+├──────────────────────────────────────────────────────────────────────────┤
+│ Service      ● running              Last tick    27s ago                 │
+│ Multiplied   2 inbound(s)           Extra billed +2.46 GB since start    │
+│ Inbounds     #2 1.20x · #3 1.30x                                         │
+├──────────────────────────────────────────────────────────────────────────┤
+│  1  Set / edit multiplier for an inbound                                 │
+│  2  List inbounds & multipliers                                          │
+│  3  Remove multiplier from an inbound                                    │
+│  4  Service status & logs                                                │
+│  0  Exit                                                                 │
+╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
 | Command | What it does |
@@ -147,21 +158,25 @@ Running `xui-mult` with no arguments opens the menu:
 | `xui-mult status` | Health check; exit code 1 on problems |
 | `xui-mult logs [-f] [-n N]` | Service logs, including every tick's billing |
 
-`xui-mult list`:
+`xui-mult list` (multiplied inbounds are highlighted, the others greyed out, disabled ones get a red `[DISABLED]` badge):
 
 ```text
-  ID  REMARK               PROTOCOL:PORT      CLIENTS   MULT  EXTRA BILLED
-   1  Direct               vless:443            43/43     x1  —
-   2  Germany Tunnel       vless:8443           14/15   x1.2  2.46 GB
-   3  Tunnel 2             trojan:2083            6/6   x1.3  1.23 GB
-CLIENTS = active/total. EXTRA BILLED = added by xui-mult since the multiplier was set.
-! inbound #2: 3 client(s) are also on a lower-multiplier inbound. 3X-UI keeps one traffic counter per client, so ALL their traffic is billed x1.2.
+╭────┬────────────────┬───────────────┬─────────┬─────────┬──────────────╮
+│ ID │ REMARK         │ PROTOCOL:PORT │ CLIENTS │    MULT │ EXTRA BILLED │
+├────┼────────────────┼───────────────┼─────────┼─────────┼──────────────┤
+│  1 │ Direct         │ vless:443     │   43/43 │   1.00x │            — │
+│  2 │ Germany Tunnel │ vless:8443    │   14/15 │ [1.20x] │     +2.46 GB │
+│  3 │ Tunnel 2       │ trojan:2083   │     6/6 │ [1.30x] │     +1.23 GB │
+╰────┴────────────────┴───────────────┴─────────┴─────────┴──────────────╯
+CLIENTS = active/total · EXTRA BILLED = added by xui-mult since the multiplier was set
+! inbound #2: 3 client(s) are also on a lower-multiplier inbound. 3X-UI keeps one traffic counter
+  per client, so ALL their traffic is billed 1.20x.
 ```
 
 Each tick with traffic logs one line per inbound:
 
 ```text
-INFO inbound #2 Germany Tunnel x1.2: 14 client(s) used 12.30 GB -> +2.46 GB extra
+INFO inbound #2 Germany Tunnel 1.20x: 14 client(s) used 12.30 GB -> +2.46 GB extra
 ```
 
 Settings live in `/etc/xui-mult/config.json` (for example `"inbounds": {"2": 1.2, "3": 1.3}`).
@@ -170,7 +185,7 @@ Settings live in `/etc/xui-mult/config.json` (for example `"inbounds": {"2": 1.2
 
 | Suite | Runs against | Result |
 |---|---|---|
-| `tests/test_xui_mult.py` | A stand-in for the v3.8.5 database with the panel's own write patterns | **25 / 25 pass** on Python 3.9 and 3.14 |
+| `tests/test_xui_mult.py` | A stand-in for the v3.8.5 database with the panel's own write patterns | **30 / 30 pass** on Python 3.9 and 3.14 |
 | `tests/e2e_real_panel.py` | A real 3X-UI v3.8.5 binary built from the official source | **13 / 13 checks pass** |
 
 The unit tests cover:
@@ -183,7 +198,8 @@ The unit tests cover:
 - idle ticks that write nothing;
 - corrupt, negative or int64-overflowing counters;
 - a locked or replaced database;
-- the CLI and the menu.
+- the CLI, the menu and its input checks;
+- table and card alignment with emoji, Persian and CJK text, in colour and plain, down to 60 columns.
 
 Three bugs deliberately planted in the code were each caught by the tests.
 
@@ -219,7 +235,7 @@ bash preflight.sh --db ./x-ui.db --real-panel      # + a copy of your DB + e2e o
 | `xui-mult status` says | Fix |
 |---|---|
 | service is not running | `systemctl start xui-mult`, then `xui-mult logs` |
-| inbound #N … no longer exists | The inbound was deleted in the panel: `xui-mult remove N` |
+| Inbound #N … no longer exists | The inbound was deleted in the panel: `xui-mult remove N` |
 | not billed, unreadable counters: … | Those clients have corrupt usage values; fix or reset them in the panel |
 | database locked by the panel | Nothing to do; the tick is billed in full on the next one |
 
@@ -286,6 +302,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/mahdizo3181/-3x-ui-multiplier/
 
 <div dir="rtl">
 
+پس از نصب، منوی برنامه خودکار باز می‌شود: گزینه‌ی ۱ را بزنید، اینباند تانل را انتخاب کنید و ضریب را وارد کنید.
+
 پیش‌نیازها: لینوکس با systemd، پایتون ۳٫۹ یا بالاتر (اگر نصب نباشد، خودکار نصب می‌شود) و 3X-UI روی SQLite. پنل‌هایی که PostgreSQL دارند پشتیبانی نمی‌شوند. اجرای دوباره‌ی نصب‌کننده برنامه را به‌روز می‌کند و تنظیمات حفظ می‌شوند.
 
 ### دستورات
@@ -304,7 +322,7 @@ xui-mult logs -f          # لاگ زنده‌ی محاسبه‌ها
 <div dir="rtl">
 
 ### تست‌ها
-- **۲۵ تست خودکار:** محاسبه‌ی دقیق ضریب، کلاینت‌های جدید، ریست و تمدید، رقابت هم‌زمان با پنل، قطع شدن برنامه وسط تراکنش، دیتابیس قفل‌شده و سرریز عدد.
+- **۳۰ تست خودکار:** محاسبه‌ی دقیق ضریب، کلاینت‌های جدید، ریست و تمدید، رقابت هم‌زمان با پنل، قطع شدن برنامه وسط تراکنش، دیتابیس قفل‌شده، سرریز عدد، و هم‌ترازی جدول‌ها با ایموجی و متن فارسی.
 - **۱۳ بررسی سرتاسری** روی باینری واقعی 3X-UI v3.8.5 که از سورس رسمی ساخته شده است. این بررسی‌ها نشان می‌دهند که خود پنل، کلاینت را وقتی مصرفِ ضریب‌دارش به سقف حجم برسد غیرفعال می‌کند.
 
 پیش از استقرار، روی کامپیوتر خودتان `bash preflight.sh` را اجرا کنید.

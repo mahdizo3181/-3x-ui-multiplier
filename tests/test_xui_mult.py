@@ -25,6 +25,8 @@ class Base(unittest.TestCase):
     """Inbounds: #1 Direct, #2 Germany Tunnel, #3 Tunnel 2 (see mock_panel.create_db)."""
 
     def setUp(self):
+        self.env = mock.patch.dict(os.environ, {"COLUMNS": "120"})   # deterministic wrapping
+        self.env.start()
         self.tmp = tempfile.mkdtemp()
         xm.CONF_DIR = os.path.join(self.tmp, "etc")
         xm.RUN_DIR = os.path.join(self.tmp, "run")
@@ -40,6 +42,8 @@ class Base(unittest.TestCase):
             json.dump(dict(xm.DEFAULT_CONFIG, db=self.db), f)
 
     def tearDown(self):
+        self.env.stop()
+        xm.C.on = False
         xm.BUSY_TIMEOUT_MS = self._busy
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -369,12 +373,12 @@ class TestCli(Base):
         mp.seed_client(self.db, "b", [2], enable=False)
         rc, out = self.main("set", "2", "1.2")
         self.assertEqual(rc, 0)
-        self.assertIn("Germany Tunnel: x1.2", out)
+        self.assertIn("Germany Tunnel: 1.20x", out)
         self.assertEqual(xm.load_config()["inbounds"], {2: 1.2})
         rc, out = self.main("list")
         row = next(line for line in out.splitlines() if "Germany Tunnel" in line)
         self.assertIn("0/1", row)
-        self.assertIn("x1.2", row)
+        self.assertIn("[1.20x]", row)
         rc, out = self.main("remove", "2")
         self.assertEqual((rc, xm.load_config()["inbounds"]), (0, {}))
 
@@ -393,7 +397,7 @@ class TestCli(Base):
         c.close()
         rc, out = self.main("status")
         self.assertEqual(rc, 1)
-        self.assertIn("inbound #3 x1.5 no longer exists", out)
+        self.assertIn("Inbound #3 [1.50x] no longer exists", out)
 
     def test_menu(self):
         mp.seed_client(self.db, "b", [2])
@@ -401,8 +405,57 @@ class TestCli(Base):
         with mock.patch("builtins.input", lambda *_: next(answers)):
             rc, out = self.quiet(xm.menu)
         self.assertEqual(rc, 0)
-        self.assertIn("x1.3", out)
-        self.assertIn("inbound #2 is back to x1", out)
+        self.assertIn("1.30x", out)
+        self.assertIn("Inbound #2 is back to 1.00x", out)
+
+
+class TestTerminalUi(Base):
+    REMARKS = ["Direct", "🇩🇪 Germany Tunnel", "تانل ترکیه‌ای 🇹🇷", "日本 Tokyo relay", "café ❤️ 👨‍👩‍👧"]
+
+    def boxed_widths(self, text):
+        lines = [l for l in text.splitlines() if xm.ANSI_RE.sub("", l).lstrip(xm.LRM)[:1] in "╭│├╰"]
+        self.assertTrue(lines)
+        return {xm.disp_width(l) for l in lines}
+
+    def test_display_width(self):
+        for s, w in [("abc", 3), ("🇩🇪", 2), ("日本", 4), ("\033[96mab\033[0m", 2), ("e\u0301", 1), ("❤️", 2),
+                     ("👨‍👩‍👧", 2), ("●", 1), ("می‌شود", 5), ("سلام", 4), ("ب\u064e", 1)]:
+            self.assertEqual(xm.disp_width(s), w, repr(s))
+
+    def test_table_stays_aligned_with_emoji_persian_and_cjk(self):
+        rows = [[(str(i), None), (r, xm.C.title), ("vless:443", None)] for i, r in enumerate(self.REMARKS)]
+        for colour in (False, True):
+            xm.C.on = colour
+            self.assertEqual(len(self.boxed_widths(xm.table(["ID", "REMARK", "PORT"], rows))), 1, colour)
+
+    def test_narrow_terminal(self):
+        rows = [[(str(i), None), (r * 3, None), ("shadowsocks:8388", None)] for i, r in enumerate(self.REMARKS)]
+        with mock.patch.dict(os.environ, {"COLUMNS": "60"}):
+            (w,) = self.boxed_widths(xm.table(["ID", "REMARK", "PROTOCOL:PORT"], rows, shrink=(1, 2)))
+            self.assertLessEqual(w, 60)
+            self.assertEqual(len(self.boxed_widths(xm.card("t", ["x" * 200, xm.SEP]))), 1)
+
+    def test_list_badges(self):
+        c = sqlite3.connect(self.db)
+        c.execute("UPDATE inbounds SET enable=0, remark='🇹🇷 Tunnel 2' WHERE id=3")
+        c.commit()
+        c.close()
+        self.set(2, 1.2)
+        _, out = self.quiet(xm.op_list)
+        self.assertEqual(len(self.boxed_widths(out)), 1)
+        self.assertIn("[DISABLED] 🇹🇷 Tunnel 2", out)
+        self.assertIn("[1.20x]", out)
+        self.assertIn("1.00x", out)
+
+    def test_menu_rejects_bad_input_and_asks_again(self):
+        answers = iter(["1", "99", "2", "0.5", "1.25", "", "0"])
+        with mock.patch("builtins.input", lambda *_: next(answers)):
+            rc, out = self.quiet(xm.menu)
+        self.assertEqual(rc, 0)
+        self.assertIn("no inbound #99", out)
+        self.assertIn("multiplier must be above 1.0", out)
+        self.assertEqual(xm.load_config()["inbounds"], {2: 1.25})
+        self.assertEqual(len(self.boxed_widths(out)), 2, "dashboard card + inbound table")
 
 
 if __name__ == "__main__":

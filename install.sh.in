@@ -132,7 +132,11 @@ if "$PY" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("pa
   yellow "! 1.x user pairs found in $CONF_DIR/config.json: they are no longer used. Delete the *_tun"
   yellow "  clients in the panel and attach those users to the tunnel inbound directly."
 fi
-echo
-"$BIN" list || true
-echo
+# Straight into the menu when a person is watching (also with `curl ... | bash`: the menu reads the
+# terminal, not the pipe). Unattended runs (CI, Ansible, ssh without -t) just print the next step.
+if [[ -t 1 && ${XUI_MULT_NO_MENU:-} != 1 ]] && { : </dev/tty; } 2>/dev/null; then
+  echo "Opening the menu (run xui-mult any time to come back)…"
+  sleep 1
+  exec "$BIN" </dev/tty
+fi
 echo "Next: give a tunnel inbound its multiplier, e.g.  xui-mult set 2 1.2   (or run xui-mult for the menu)"

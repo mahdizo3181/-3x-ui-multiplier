@@ -24,6 +24,8 @@ import fcntl
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import socket
 import sqlite3
@@ -31,8 +33,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 PANEL_VERIFIED = "v3.8.5"
 SCALE = 1000                   # fixed-point multiplier: 1200 == 1.200x
 TRAFFIC_MAX = (1 << 63) - 1    # same cap as the panel's ClampedAddExpr
@@ -65,18 +68,152 @@ class C:
     @classmethod
     def w(cls, code, s):
         return f"\033[{code}m{s}\033[0m" if cls.on else str(s)
-    red = classmethod(lambda c, s: c.w("31", s))
-    green = classmethod(lambda c, s: c.w("32", s))
-    yellow = classmethod(lambda c, s: c.w("33", s))
-    cyan = classmethod(lambda c, s: c.w("36", s))
+    red = classmethod(lambda c, s: c.w("91", s))
+    green = classmethod(lambda c, s: c.w("92", s))
+    yellow = classmethod(lambda c, s: c.w("93", s))
+    cyan = classmethod(lambda c, s: c.w("96", s))
     bold = classmethod(lambda c, s: c.w("1", s))
     dim = classmethod(lambda c, s: c.w("2", s))
+    dim_red = classmethod(lambda c, s: c.w("2;31", s))
+    title = classmethod(lambda c, s: c.w("1;96", s))
 
 
 def ok(msg): print(C.green("✔ ") + msg)
 def bad(msg): print(C.red("✖ ") + msg)
 def warn(msg): print(C.yellow("! ") + msg)
 def info(msg): print(C.cyan("• ") + msg)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+LRM = "‎"   # left-to-right mark: keeps a row's layout LTR in terminals that reorder Persian text
+
+
+def disp_width(s):
+    """Terminal columns taken by s. Colours and zero-width characters take none: the ZWNJ in Persian
+    text, diacritics, joiners, direction marks. Wide East Asian characters and emoji take two, a flag
+    (two regional indicators) takes two, VS16 makes the previous symbol a two-column emoji, and a
+    character after a zero-width joiner is drawn inside the same emoji."""
+    w = prev = 0
+    joined = False
+    for ch in ANSI_RE.sub("", s):
+        if ch == "️":
+            if prev == 1:
+                w, prev = w + 1, 2
+            continue
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf") or "︀" <= ch <= "︎":
+            joined = ch == "‍"
+            continue
+        if joined:
+            joined = False
+            continue
+        prev = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        w += prev
+    return w
+
+
+def is_rtl(s):
+    return any(unicodedata.bidirectional(ch) in ("R", "AL") for ch in s)
+
+
+def plain(s):
+    """Printable single-line text (a remark may hold tabs or newlines)."""
+    return "".join(" " if unicodedata.category(ch) == "Cc" else ch for ch in str(s))
+
+
+def fit(s, width):
+    """Cut text to at most `width` columns, ending with … when something was cut. Colours are kept."""
+    if disp_width(s) <= width:
+        return s
+    out = ""
+    for part in re.split(f"({ANSI_RE.pattern})", s):
+        if ANSI_RE.fullmatch(part):
+            out += part
+            continue
+        for ch in part:
+            if disp_width(out + ch) + 1 > width:
+                return out + "…" + ("\033[0m" if ANSI_RE.search(out) else "")
+            out += ch
+    return out
+
+
+def pad(s, width, right=False):
+    gap = " " * max(width - disp_width(s), 0)
+    return gap + s if right else s + gap
+
+
+def term_width():
+    return shutil.get_terminal_size((100, 24)).columns
+
+
+def wrap(text, width):
+    """Word-wrap plain text to `width` columns."""
+    lines, cur = [], ""
+    for word in text.split(" "):
+        cand = f"{cur} {word}" if cur else word
+        if cur and disp_width(cand) > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = cand
+    lines.append(cur)
+    return [fit(line, width) for line in lines]
+
+
+SEP = object()   # a ├───┤ divider inside a card
+
+
+def card_width():
+    """Inner width of cards: the terminal, at most 72 columns."""
+    return max(min(term_width(), 76) - 4, 30)
+
+
+def card(title, rows, footer=""):
+    """Rounded card with the title in the top border. Rows may carry colours; wrap them to card_width()
+    (anything wider is cut)."""
+    inner = card_width()
+    b = C.dim
+    head = f"─ {title} " if title else ""
+    out = [b("╭") + (b("─ ") + C.title(title) + " " if title else "") + b("─" * (inner + 2 - disp_width(head)) + "╮")]
+    for r in rows:
+        if r is SEP:
+            out.append(b("├" + "─" * (inner + 2) + "┤"))
+        else:
+            out.append(b("│ ") + pad(fit(r, inner), inner) + b(" │"))
+    tail = f" {footer} ─" if footer else ""
+    out.append(b("╰" + "─" * (inner + 2 - disp_width(tail))) + (" " + C.dim(footer) + b(" ─") if footer else "") + b("╯"))
+    return "\n".join(out)
+
+
+def table(headers, rows, right=(), shrink=()):
+    """Box-drawn table aligned on display width (emoji, flags, CJK, Persian). Each cell is
+    (plain text, style function or None). When the terminal is too narrow, the `shrink` columns give
+    way in that order (down to 8 columns each) and their text is cut with …."""
+    rows = [[(plain(t), f) for t, f in r] for r in rows]
+    widths = [max([disp_width(h)] + [disp_width(r[i][0]) for r in rows]) for i, h in enumerate(headers)]
+    over = sum(widths) + 3 * len(widths) + 1 - term_width()
+    for i in shrink:
+        if over <= 0:
+            break
+        new = max(widths[i] - over, min(widths[i], 8))
+        over, widths[i] = over - (widths[i] - new), new
+    b = C.dim
+
+    def line(cells):
+        out, rtl = [], False
+        for i, (t, f) in enumerate(cells):
+            t = fit(t, widths[i])
+            text = pad(t, widths[i], right=i in right)
+            if f:   # colour the text, not the padding
+                text = text.replace(t, f(t), 1)
+            if is_rtl(t):
+                rtl, text = True, text + LRM
+            out.append(text)
+        row = b("│ ") + b(" │ ").join(out) + b(" │")
+        return LRM + row if rtl else row
+
+    rule = lambda l, m, r: b(l + m.join("─" * (w + 2) for w in widths) + r)  # noqa: E731
+    return "\n".join([rule("╭", "┬", "╮"), line([(h, C.bold) for h in headers]), rule("├", "┼", "┤")]
+                     + [line(r) for r in rows] + [rule("╰", "┴", "╯")])
 
 
 def human(n):
@@ -127,7 +264,9 @@ def mult_fp(k):
 
 
 def fmt_k(k):
-    return f"x{k:g}"
+    """1.2 -> '1.20x', 1.234 -> '1.234x'"""
+    s = f"{float(k):.3f}"
+    return (s[:-1] if s.endswith("0") else s) + "x"
 
 
 # =================================================================================== files / config
@@ -494,9 +633,9 @@ def op_set(inbound_id, mult):
         cfg["inbounds"][inbound_id] = k
     reload_daemon()
     n = inbound_client_counts(conn).get(inbound_id, (0, 0))[1]
-    what = f"{fmt_k(old)} -> {fmt_k(k)}" if old else fmt_k(k)
-    ok(f"inbound #{inbound_id} {ib['remark'] or ''}: {what}. Its {n} client(s), and any added later, pay "
-       f"{fmt_k(k)} on traffic from now on.")
+    what = f"{fmt_k(old)} → {fmt_k(k)}" if old else fmt_k(k)
+    ok(f"Inbound #{inbound_id} {plain(ib['remark'] or '')}: {C.title(what)}. Its {n} client(s), and any added "
+       f"later, pay {fmt_k(k)} on traffic from now on.")
 
 
 def op_remove(inbound_id):
@@ -506,7 +645,16 @@ def op_remove(inbound_id):
         del cfg["inbounds"][inbound_id]
     prune_ledger(db_connect(cfg["db"]), cfg["inbounds"])
     reload_daemon()
-    ok(f"inbound #{inbound_id} is back to x1 (traffic already billed stays billed)")
+    ok(f"Inbound #{inbound_id} is back to 1.00x (traffic already billed stays billed)")
+
+
+def _remark_style(dim):
+    def style(t):
+        badge = "[DISABLED]"
+        rest = t[len(badge):] if t.startswith(badge) else t
+        rest = dim(rest) if dim else rest
+        return C.dim_red(badge) + rest if t.startswith(badge) else rest
+    return style
 
 
 def op_list():
@@ -518,21 +666,35 @@ def op_list():
     for email, e in conn.execute("SELECT email, extra_total FROM xui_mult_ledger"):
         if email in mults:
             extra[mults[email][1]] = extra.get(mults[email][1], 0) + (e or 0)
-    print(C.bold(f"{'ID':>4}  {'REMARK':<20} {'PROTOCOL:PORT':<16} {'CLIENTS':>9}  {'MULT':>5}  EXTRA BILLED"))
-    for ib in all_inbounds(conn):
-        active, total = counts.get(ib["id"], (0, 0))
+    inbounds = all_inbounds(conn)
+    if not inbounds:
+        info("the panel has no inbounds yet")
+        return
+    rows = []
+    for ib in inbounds:
         k = cfg["inbounds"].get(ib["id"])
-        line = (f"{ib['id']:>4}  {(ib['remark'] or '')[:20]:<20} {ib['protocol'] + ':' + str(ib['port']):<16} "
-                f"{f'{active}/{total}':>9}  {fmt_k(k) if k else 'x1':>5}  "
-                f"{human(extra.get(ib['id'], 0)) if k else '—'}")
-        print(C.bold(line) if k else line + ("" if ib["enable"] else C.dim("  (disabled)")))
-    print(C.dim("CLIENTS = active/total. EXTRA BILLED = added by xui-mult since the multiplier was set."))
-    missing = [i for i in cfg["inbounds"] if not any(ib["id"] == i for ib in all_inbounds(conn))]
-    for i in missing:
-        warn(f"inbound #{i} has a multiplier but no longer exists — `xui-mult remove {i}`")
-    for ib, n in sorted(mixed_clients(conn, cfg["inbounds"], mults).items()):
-        warn(f"inbound #{ib}: {n} client(s) are also on a lower-multiplier inbound. 3X-UI keeps one traffic "
-             f"counter per client, so ALL their traffic is billed {fmt_k(cfg['inbounds'][ib])}.")
+        dim = None if k else C.dim                    # inbounds without a multiplier are greyed out
+        active, total = counts.get(ib["id"], (0, 0))
+        rows.append([(str(ib["id"]), C.bold if k else dim),
+                     (("" if ib["enable"] else "[DISABLED] ") + plain(ib["remark"] or ""), _remark_style(dim)),
+                     (f"{ib['protocol']}:{ib['port']}", dim),
+                     (f"{active}/{total}", dim),
+                     (f"[{fmt_k(k)}]", C.title) if k else ("1.00x", C.dim),
+                     (f"+{human(extra.get(ib['id'], 0))}", C.yellow) if k else ("—", C.dim)])
+    print(table(["ID", "REMARK", "PROTOCOL:PORT", "CLIENTS", "MULT", "EXTRA BILLED"], rows,
+                right={0, 3, 4, 5}, shrink=(1, 2, 5)))
+    width = term_width() - 2
+    for line in wrap("CLIENTS = active/total · EXTRA BILLED = added by xui-mult since the multiplier was set",
+                     width):
+        print(C.dim(line))
+    notes = [f"inbound #{i} has a multiplier but no longer exists — `xui-mult remove {i}`"
+             for i in cfg["inbounds"] if not any(ib["id"] == i for ib in inbounds)]
+    notes += [f"inbound #{ib}: {n} client(s) are also on a lower-multiplier inbound. 3X-UI keeps one traffic "
+              f"counter per client, so ALL their traffic is billed {fmt_k(cfg['inbounds'][ib])}."
+              for ib, n in sorted(mixed_clients(conn, cfg["inbounds"], mults).items())]
+    for note in notes:
+        parts = wrap(note, width)
+        print(C.yellow("! ") + parts[0] + "".join("\n  " + p for p in parts[1:]))
 
 
 def read_status():
@@ -549,63 +711,75 @@ def service_active():
 
 
 def op_status():
-    problems = 0
+    rows, problems, width = [], 0, card_width()
+
+    def line(icon, text):
+        parts = wrap(text, width - 2)
+        rows.append(f"{icon} {parts[0]}")
+        rows.extend(f"  {p}" for p in parts[1:])
 
     def check(cond, good, badmsg, hint=""):
         nonlocal problems
         if cond:
-            ok(good)
+            line(C.green("✔"), good)
         else:
             problems += 1
-            bad(badmsg + (C.dim(f"  → {hint}") if hint else ""))
+            line(C.red("✖"), badmsg + (f" → {hint}" if hint else ""))
 
-    print(C.bold(f"xui-mult {VERSION}  (verified for 3X-UI {PANEL_VERIFIED})"))
+    def show(code):
+        rows.append(SEP)
+        if problems:
+            line(C.yellow("!"), f"{problems} problem(s)")
+        else:
+            line(C.green("✔"), "All checks passed")
+        print(card(f"xui-mult {VERSION} · status", rows, footer=f"verified on 3X-UI {PANEL_VERIFIED}"))
+        return code
+
     try:
         cfg = load_config()
-        ok(f"config {CONF_PATH}: {len(cfg['inbounds'])} multiplied inbound(s)")
+        check(True, f"Config {CONF_PATH} · {len(cfg['inbounds'])} multiplied inbound(s)", "")
     except (XMError, ValueError, OSError) as e:
-        bad(f"config: {e}")
-        return 1
+        check(False, "", f"Config: {e}")
+        return show(1)
     active = service_active()
-    check(active, "service running", "service is not running", "systemctl start xui-mult")
+    check(active, f"Service {C.green('● running')}", f"Service {C.red('● stopped')}", "systemctl start xui-mult")
     st = read_status()
     if st:
-        age = int(time.time()) - st["last_tick"]
-        check(age < max(60, 5 * cfg["interval"]), f"last tick {age}s ago ({st['tick_ms']} ms)",
-              f"last tick {age}s ago — daemon stuck?", "xui-mult logs")
-        check(not st.get("error") or st.get("db_busy"), "last tick billed without errors",
-              f"last tick failed: {st.get('error')}", "xui-mult logs")
+        age = int(time.time() - st["last_tick"])
+        check(age < max(60, 5 * cfg["interval"]), f"Last tick {age}s ago ({st['tick_ms']} ms)",
+              f"Last tick {age}s ago — daemon stuck?", "xui-mult logs")
+        check(not st.get("error") or st.get("db_busy"), "Last tick billed without errors",
+              f"Last tick failed: {st.get('error')}", "xui-mult logs")
         if st.get("db_busy"):
-            warn("the last tick found the database locked by the panel (billed in full on the next one)")
-        check(not st.get("skipped"), "all clients' counters readable",
-              f"not billed, unreadable counters: {', '.join(st.get('skipped') or [])}", "fix them in the panel")
-        if st.get("extra_since_start"):
-            info(f"since the service started: {human(st['raw_since_start'])} used on multiplied inbounds "
-                 f"-> +{human(st['extra_since_start'])} extra billed")
+            line(C.yellow("!"), "The last tick found the database locked by the panel (billed in full on the next one)")
+        check(not st.get("skipped"), "All clients' counters readable",
+              f"Not billed, unreadable counters: {', '.join(st.get('skipped') or [])}", "fix them in the panel")
     elif active:
-        warn("no heartbeat yet")
+        line(C.yellow("!"), "No heartbeat yet")
     try:
         conn = db_connect(cfg["db"])
         jm = q1(conn, "PRAGMA journal_mode")[0]
-        ok(f"database {cfg['db']} (journal_mode={jm}, busy_timeout={BUSY_TIMEOUT_MS} ms)")
+        check(True, f"Database {cfg['db']} · journal {jm} · busy timeout {BUSY_TIMEOUT_MS // 1000} s", "")
     except (XMError, sqlite3.Error) as e:
-        bad(str(e))
-        return 1
+        check(False, "", f"Database: {e}")
+        return show(1)
     ver = (sh(["/usr/local/x-ui/x-ui", "-v"], capture_output=True, text=True, timeout=5,
               stdin=subprocess.DEVNULL).stdout or "").strip()
-    if ver:
-        (ok if PANEL_VERIFIED.lstrip("v") in ver else warn)(
-            f"panel version: {ver}" + ("" if PANEL_VERIFIED.lstrip("v") in ver else
-                                       f"  (not verified — tool was verified on {PANEL_VERIFIED})"))
+    if ver and PANEL_VERIFIED.lstrip("v") in ver:
+        line(C.green("✔"), f"Panel 3X-UI {ver}")
+    elif ver:
+        line(C.yellow("!"), f"Panel 3X-UI {ver} — not verified (xui-mult was verified on {PANEL_VERIFIED})")
     counts = inbound_client_counts(conn)
     for i, k in cfg["inbounds"].items():
         ib = inbound_row(conn, i)
-        check(ib is not None, f"inbound #{i} {(ib or {}).get('remark') or ''} {fmt_k(k)}: "
-              f"{counts.get(i, (0, 0))[1]} client(s)", f"inbound #{i} {fmt_k(k)} no longer exists",
+        check(ib is not None, f"Inbound #{i} {plain((ib or {}).get('remark') or '')} {C.title(f'[{fmt_k(k)}]')} · "
+              f"{counts.get(i, (0, 0))[1]} client(s)", f"Inbound #{i} [{fmt_k(k)}] no longer exists",
               f"xui-mult remove {i}")
-    print()
-    (ok("all checks passed") if not problems else warn(f"{problems} problem(s)"))
-    return 0 if not problems else 1
+    if st and st.get("extra_since_start"):
+        rows.append(SEP)
+        line(C.cyan("•"), f"Since the service started: {human(st['raw_since_start'])} used on multiplied inbounds "
+                          f"→ {C.yellow('+' + human(st['extra_since_start']))} extra billed")
+    return show(0 if not problems else 1)
 
 
 def op_logs(follow=False, lines=100):
@@ -618,20 +792,6 @@ def op_logs(follow=False, lines=100):
 
 # =================================================================================== menu
 
-def header():
-    try:
-        n = len(load_config()["inbounds"])
-    except (XMError, ValueError, OSError):
-        n = "?"
-    st = read_status()
-    tick = f"{int(time.time()) - st['last_tick']}s ago" if st else "—"
-    svc = C.green("● running") if service_active() else C.red("● stopped")
-    print()
-    print(C.bold(" xui-mult ") + C.dim(f"v{VERSION}") + " — inbound traffic multipliers for 3X-UI")
-    print(f" Service: {svc}   Multiplied inbounds: {n}   Last tick: {tick}")
-    print(" " + "─" * 58)
-
-
 MENU = [
     ("1", "Set / edit multiplier for an inbound"),
     ("2", "List inbounds & multipliers"),
@@ -641,13 +801,51 @@ MENU = [
 ]
 
 
+def dashboard():
+    """The menu screen: a card with the service state, the multiplied inbounds and the options."""
+    try:
+        ks = load_config()["inbounds"]
+    except (XMError, ValueError, OSError):
+        ks = None
+    st, width = read_status(), card_width()
+    svc = C.green("● running") if service_active() else C.red("● stopped")
+    tick = f"{int(time.time() - st['last_tick'])}s ago" if st else "—"
+    extra = (C.yellow("+" + human(st.get("extra_since_start", 0))) + C.dim(" since start")) if st else "—"
+    count = "config error" if ks is None else f"{len(ks)} inbound(s)"
+    pairs = [("Service", svc), ("Last tick", tick), ("Multiplied", count), ("Extra billed", extra)]
+    rows = [C.dim("Inbound traffic multipliers for 3X-UI"), SEP]
+    half = width // 2
+    kv = lambda k, v, w: pad(C.dim(k), 13) + pad(v, w - 13)  # noqa: E731
+    if width >= 60:
+        rows += [kv(*pairs[i], half) + kv(*pairs[i + 1], width - half) for i in (0, 2)]
+    else:
+        rows += [kv(k, v, width) for k, v in pairs]
+    if ks:
+        rows.append(kv("Inbounds", C.title(fit(" · ".join(f"#{i} {fmt_k(k)}" for i, k in ks.items()), width - 13)),
+                       width))
+    rows.append(SEP)
+    rows += [f" {C.dim(k) if k == '0' else C.title(k)}  {C.dim(label) if k == '0' else label}" for k, label in MENU]
+    print(card(f"xui-mult v{VERSION}", rows))
+
+
+def pick(ids, what="inbound"):
+    def validate(v):
+        i = int(v)
+        if i not in ids:
+            raise ValueError(f"no {what} #{i}")
+        return i
+    return validate
+
+
 def menu():
+    first = True
     while True:
-        header()
-        for k, label in MENU:
-            print(f"  {C.cyan(k)}) {label}")
+        if not first and sys.stdout.isatty():
+            print("\033[2J\033[H", end="")      # redraw on a clean screen (the first one keeps what was above)
+        first = False
+        dashboard()
         try:
-            choice = input("\n Choose: ").strip()
+            choice = input(C.bold("\n Choose › ")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -656,14 +854,20 @@ def menu():
                 return 0
             elif choice == "1":
                 op_list()
-                ib = ask("Inbound ID", validate=int)
-                current = load_config()["inbounds"].get(ib)
-                op_set(ib, ask("Multiplier", current or "1.2", validate=parse_mult))
+                cfg = load_config()
+                ids = {ib["id"] for ib in all_inbounds(db_connect(cfg["db"]))}
+                ib = ask("\nInbound ID " + C.dim("(Ctrl+C to cancel)"), validate=pick(ids))
+                op_set(ib, ask("Multiplier", cfg["inbounds"].get(ib) or 1.2, validate=parse_mult))
             elif choice == "2":
                 op_list()
             elif choice == "3":
-                op_list()
-                op_remove(ask("Inbound ID", validate=int))
+                configured = load_config()["inbounds"]
+                if not configured:
+                    info("no inbound has a multiplier yet")
+                else:
+                    op_list()
+                    op_remove(ask("\nInbound ID " + C.dim("(Ctrl+C to cancel)"),
+                                  validate=pick(set(configured), "multiplied inbound")))
             elif choice == "4":
                 op_status()
                 if confirm("\nFollow live billing? (Ctrl+C to go back)", True):
@@ -671,7 +875,6 @@ def menu():
                 continue
             else:
                 bad("unknown option")
-                continue
         except KeyboardInterrupt:
             print()
         except (XMError, sqlite3.Error, OSError) as e:
