@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# xui-mult installer — per-inbound traffic multiplier for 3X-UI (verified on v3.8.5)
+# xui-mult installer — per-inbound traffic multipliers for 3X-UI (verified on v3.8.5)
 # Usage:  bash install.sh            install or upgrade
-#         bash install.sh uninstall  remove (panel clients are not touched)
+#         bash install.sh uninstall  remove (clients and their usage are not touched)
 set -euo pipefail
 
 VERSION="__VERSION__"
@@ -19,10 +19,22 @@ die()   { red "✖ $*"; exit 1; }
 [[ $EUID -eq 0 ]] || die "run as root:  sudo bash install.sh"
 
 if [[ "${1:-}" == "uninstall" ]]; then
-  if [[ -x $BIN ]]; then exec "$BIN" uninstall; fi
   systemctl disable --now xui-mult 2>/dev/null || true
-  rm -f "$UNIT" "$BIN"; rm -rf "$APP_DIR"; systemctl daemon-reload || true
-  green "✔ removed"; exit 0
+  rm -f "$UNIT" "$BIN"; rm -rf "$APP_DIR" /run/xui-mult; systemctl daemon-reload || true
+  if command -v python3 >/dev/null; then   # the ledger is useless without the service
+    python3 - "$CONF_DIR/config.json" "$XUI_DB" <<'PYEOF' || true
+import json, sqlite3, sys
+try:
+    db = json.load(open(sys.argv[1])).get("db") or sys.argv[2]
+except (OSError, ValueError):
+    db = sys.argv[2]
+c = sqlite3.connect(db, timeout=10)
+c.execute("DROP TABLE IF EXISTS xui_mult_ledger")
+c.execute("DROP TABLE IF EXISTS tunnel_multiplier_ledger")   # from 1.x
+c.commit()
+PYEOF
+  fi
+  green "✔ removed. Settings kept in $CONF_DIR (delete with: rm -rf $CONF_DIR)"; exit 0
 fi
 
 echo "xui-mult $VERSION installer"
@@ -68,8 +80,7 @@ chmod 755 "$BIN"
 if [[ ! -f $CONF_DIR/config.json ]]; then
   "$PY" - "$XUI_DB" "$CONF_DIR/config.json" <<'PYEOF'
 import json, sys
-cfg = {"db": sys.argv[1], "api_url": "", "api_token": "", "link_host": "", "api_host": "auto",
-       "verify_tls": "auto", "interval": 7, "sub_link": True, "pairs": []}
+cfg = {"db": sys.argv[1], "interval": 7, "inbounds": {}}
 open(sys.argv[2], "w").write(json.dumps(cfg, indent=2) + "\n")
 PYEOF
 fi
@@ -78,8 +89,8 @@ chmod 600 "$CONF_DIR/config.json"
 # --- systemd service
 cat > "$UNIT" <<EOF
 [Unit]
-Description=xui-mult: per-inbound traffic multiplier for 3X-UI
-Documentation=https://github.com/MHSanaei/3x-ui/issues/5791
+Description=xui-mult: per-inbound traffic multipliers for 3X-UI
+Documentation=https://github.com/mahdizo3181/-3x-ui-multiplier
 After=network-online.target x-ui.service
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -116,12 +127,12 @@ if systemctl is-active --quiet xui-mult; then green "✔ service xui-mult is run
   yellow "! service did not start yet — check: xui-mult logs"; fi
 
 green "✔ installed xui-mult $VERSION"
-echo
-if ! grep -q '"api_token": "[^"]' "$CONF_DIR/config.json"; then
-  echo "Next: connect it to your panel (create an API token with FULL access in the panel first)."
-  if { : </dev/tty; } 2>/dev/null; then
-    read -r -p "Run setup now? [Y/n] " a </dev/tty 2>/dev/null || a=n
-    if [[ -z $a || $a == [Yy]* ]]; then "$BIN" setup </dev/tty || true; fi
-  fi
+if "$PY" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("pairs") else 1)' \
+     "$CONF_DIR/config.json" 2>/dev/null; then
+  yellow "! 1.x user pairs found in $CONF_DIR/config.json: they are no longer used. Delete the *_tun"
+  yellow "  clients in the panel and attach those users to the tunnel inbound directly."
 fi
-echo "Open the menu any time with:  xui-mult"
+echo
+"$BIN" list || true
+echo
+echo "Next: give a tunnel inbound its multiplier, e.g.  xui-mult set 2 1.2   (or run xui-mult for the menu)"

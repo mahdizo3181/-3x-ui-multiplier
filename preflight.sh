@@ -43,17 +43,16 @@ if [[ -n $DB ]]; then
 import sys
 sys.path.insert(0, ".")
 import xui_mult as xm
-path = sys.argv[1]
-conn = xm.db_connect(path)                      # schema check (refuses incompatible layouts)
-print("integrity     :", xm.q1(conn, "PRAGMA integrity_check")[0])
-print("journal mode  :", xm.q1(conn, "PRAGMA journal_mode")[0], "(left as the panel set it)")
-url, domain = xm.detect_panel_url(conn)
-print("panel API URL :", url)
-print("panel domain  :", domain or "(none)", "-> API Host header" if domain else "")
-print("inbounds      :", ", ".join(f"#{i['id']} {i['protocol']}:{i['port']}" for i in xm.all_inbounds(conn)) or "none")
-print("clients       :", xm.q1(conn, "SELECT COUNT(*) FROM clients")[0])
-neg = xm.q1(conn, "SELECT COUNT(*) FROM clients WHERE expiry_time < 0")[0]
-print("delayed start :", neg, "client(s) with 'start after first use'")
+conn = xm.db_connect(sys.argv[1])               # schema check (refuses incompatible layouts)
+print("integrity    :", xm.q1(conn, "PRAGMA integrity_check")[0])
+print("journal mode :", xm.q1(conn, "PRAGMA journal_mode")[0], "(left as the panel set it)")
+counts = xm.inbound_client_counts(conn)
+for ib in xm.all_inbounds(conn):
+    print(f"inbound #{ib['id']:<3}: {ib['protocol']}:{ib['port']}  {ib['remark'] or ''}  "
+          f"({counts.get(ib['id'], (0, 0))[1]} clients)")
+multi = xm.q1(conn, "SELECT COUNT(*) FROM (SELECT client_id FROM client_inbounds GROUP BY client_id "
+                    "HAVING COUNT(*) > 1)")[0]
+print("clients on several inbounds:", multi, "(if one of them is multiplied, all their traffic is)")
 print("ok: xui-mult can run against this database")
 EOF
 fi

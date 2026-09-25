@@ -5,11 +5,14 @@ import os
 import random
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -17,10 +20,10 @@ sys.path.insert(0, HERE)
 import xui_mult as xm  # noqa: E402
 import mock_panel as mp  # noqa: E402
 
-GB = 1024 ** 3
-
 
 class Base(unittest.TestCase):
+    """Inbounds: #1 Direct, #2 Germany Tunnel, #3 Tunnel 2 (see mock_panel.create_db)."""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         xm.CONF_DIR = os.path.join(self.tmp, "etc")
@@ -28,18 +31,16 @@ class Base(unittest.TestCase):
         xm.CONF_PATH = os.path.join(xm.CONF_DIR, "config.json")
         xm.STATUS_PATH = os.path.join(xm.RUN_DIR, "status.json")
         xm.C.on = False
+        self._busy = xm.BUSY_TIMEOUT_MS
         self.db = os.path.join(self.tmp, "x-ui.db")
         mp.create_db(self.db)
         self.panel = mp.Panel(self.db)
-        url = self.panel.serve()
         os.makedirs(xm.CONF_DIR)
-        cfg = dict(xm.DEFAULT_CONFIG, db=self.db, api_url=url, api_token=mp.TOKEN, link_host="vpn.example.com",
-                   pairs=[])
         with open(xm.CONF_PATH, "w") as f:
-            json.dump(cfg, f)
+            json.dump(dict(xm.DEFAULT_CONFIG, db=self.db), f)
 
     def tearDown(self):
-        self.panel.server.shutdown()
+        xm.BUSY_TIMEOUT_MS = self._busy
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def q(self, sql, args=()):
@@ -49,14 +50,14 @@ class Base(unittest.TestCase):
         finally:
             c.close()
 
-    def traffic(self, email):
-        r = self.q("SELECT up, down, enable, total FROM client_traffics WHERE email=?", (email,))
+    def used(self, email):
+        r = self.q("SELECT up, down FROM client_traffics WHERE email=?", (email,))
         return r[0] if r else None
 
-    def tick(self):
+    def tick(self, dry_run=False):
         class A:
-            dry_run = False
             once = True
+        A.dry_run = dry_run
         xm._stop = False
         xm.run_daemon(A())
 
@@ -65,230 +66,343 @@ class Base(unittest.TestCase):
             r = fn(*a, **kw)
         return r, out.getvalue()
 
+    def set(self, ib, k):
+        self.quiet(xm.op_set, ib, k)
 
-class TestAccounting(Base):
-    def test_concurrent_billing_is_exact(self):
-        """Panel writers (atomic + read-then-save inside IMMEDIATE txns) race the daemon."""
-        mp.seed_client(self.db, "u1", [1])
-        mp.seed_client(self.db, "u1_tun", [2])
+    def status(self):
+        with open(xm.STATUS_PATH) as f:
+            return json.load(f)
+
+
+class TestBilling(Base):
+    def test_tunnel_client_pays_k(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("b", up=1000, down=5000)
+        self.tick()
+        self.assertEqual(self.used("b"), (1200, 6000))
+        self.tick()
+        self.assertEqual(self.used("b"), (1200, 6000), "our own credit is never billed again")
+
+    def test_other_inbounds_untouched(self):
+        mp.seed_client(self.db, "a", [1])
+        mp.seed_client(self.db, "c", [3])
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("a", down=1000)
+        self.panel.add_traffic("c", down=1000)
+        self.tick()
+        self.assertEqual(self.used("a"), (0, 1000))
+        self.assertEqual(self.used("c"), (0, 1000))
+
+    def test_membership_comes_from_client_inbounds_not_the_stale_pointer(self):
+        mp.seed_client(self.db, "m", [1, 2])      # client_traffics.inbound_id says 1
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("m", down=1000)
+        self.tick()
+        self.assertEqual(self.used("m"), (0, 1200))
+        _, out = self.quiet(xm.op_list)
+        self.assertIn("inbound #2: 1 client(s) are also on a lower-multiplier inbound", out)
+
+    def test_highest_multiplier_wins(self):
+        mp.seed_client(self.db, "d", [2, 3])
+        self.set(2, 1.2)
+        self.set(3, 1.5)
+        self.tick()
+        self.panel.add_traffic("d", down=1000)
+        self.tick()
+        self.assertEqual(self.used("d"), (0, 1500))
+
+    def test_new_clients_are_picked_up_and_history_is_never_billed(self):
+        mp.seed_client(self.db, "old", [2], down=10_000)        # used before the multiplier was set
+        self.set(2, 1.2)
+        self.tick()
+        self.assertEqual(self.used("old"), (0, 10_000))
+        mp.seed_client(self.db, "new", [2])                      # created later in the panel
+        self.tick()
+        for e in ("old", "new"):
+            self.panel.add_traffic(e, down=1000)
+        self.tick()
+        self.assertEqual(self.used("old"), (0, 11_200))
+        self.assertEqual(self.used("new"), (0, 1200))
+
+    def test_fractions_carry_over(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.234)
         conn = xm.db_connect(self.db)
-        xm.ledger_init(conn, "u1_tun")
-        direct, tun, stop = [0], [0], [False]
+        xm.bill(conn, {2: 1.234})
+        for _ in range(1000):
+            self.panel.add_traffic("b", down=3)                  # 3 x 0.234 = 0.702 extra per tick
+            xm.bill(conn, {2: 1.234})
+        self.assertEqual(self.used("b"), (0, 3000 + 3000 * 234 // 1000))
+
+    def test_concurrent_panel_writers_are_exact(self):
+        """Panel writers (atomic adds + read-then-save inside IMMEDIATE transactions) race the daemon."""
+        mp.seed_client(self.db, "a", [1])
+        mp.seed_client(self.db, "b", [2])
+        conn = xm.db_connect(self.db)
+        xm.bill(conn, {2: 1.2})
+        raw, stop = {"a": 0, "b": 0}, [False]
 
         def writer():
             c = sqlite3.connect(self.db, timeout=10, isolation_level=None)
             c.execute("PRAGMA busy_timeout=10000")
             while not stop[0]:
-                du, dt = random.randint(1, 5000), random.randint(1, 5000)
+                e, n = random.choice("ab"), random.randint(1, 5000)
                 c.execute("BEGIN IMMEDIATE")
                 if random.random() < 0.5:
-                    c.execute("UPDATE client_traffics SET down=down+? WHERE email='u1'", (du,))
-                    c.execute("UPDATE client_traffics SET down=down+? WHERE email='u1_tun'", (dt,))
+                    c.execute("UPDATE client_traffics SET down = down + ? WHERE email = ?", (n, e))
                 else:
-                    m = c.execute("SELECT down FROM client_traffics WHERE email='u1'").fetchone()[0]
-                    s = c.execute("SELECT down FROM client_traffics WHERE email='u1_tun'").fetchone()[0]
+                    cur = c.execute("SELECT down FROM client_traffics WHERE email = ?", (e,)).fetchone()[0]
                     time.sleep(0.001)
-                    c.execute("UPDATE client_traffics SET down=? WHERE email='u1'", (m + du,))
-                    c.execute("UPDATE client_traffics SET down=? WHERE email='u1_tun'", (s + dt,))
+                    c.execute("UPDATE client_traffics SET down = ? WHERE email = ?", (cur + n, e))
                 c.execute("COMMIT")
-                direct[0] += du
-                tun[0] += dt
+                raw[e] += n
                 time.sleep(0.002)
 
         ths = [threading.Thread(target=writer) for _ in range(2)]
         [t.start() for t in ths]
         ticks, t0 = 0, time.time()
         while time.time() - t0 < 3:
-            xm.account(conn, "u1", "u1_tun", 1200)
+            xm.bill(conn, {2: 1.2})
             ticks += 1
             time.sleep(0.003)
         stop[0] = True
         [t.join() for t in ths]
-        xm.account(conn, "u1", "u1_tun", 1200)
-        master = self.traffic("u1")[1]
+        xm.bill(conn, {2: 1.2})
         self.assertGreater(ticks, 100)
-        self.assertEqual(master, direct[0] + tun[0] * 1200 // 1000)
-        self.assertEqual(self.traffic("u1_tun")[1], tun[0], "shadow row must never be written")
-        led = xm.ledger_row(conn, "u1_tun")
-        self.assertEqual(led["raw_total"], tun[0])
-        self.assertEqual(led["billed_total"], tun[0] * 1200 // 1000)
+        self.assertEqual(self.used("a")[1], raw["a"])
+        self.assertEqual(self.used("b")[1], raw["b"] + raw["b"] * 200 // 1000)
 
-    def test_reset_detection_and_first_sight_baseline(self):
-        mp.seed_client(self.db, "u1", [1])
-        mp.seed_client(self.db, "u1_tun", [2], down=5000)
+    def test_panel_reset_is_followed(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("b", down=1000)
+        self.tick()
+        self.panel.reset_traffic("b")                            # renewal
+        self.tick()
+        self.assertEqual(self.used("b"), (0, 0))
+        self.panel.add_traffic("b", down=500)
+        self.tick()
+        self.assertEqual(self.used("b"), (0, 600))
+
+    def test_changing_the_multiplier_applies_to_new_traffic(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("b", down=1000)
+        self.tick()
+        self.set(2, 1.5)
+        self.panel.add_traffic("b", down=1000)
+        self.tick()
+        self.assertEqual(self.used("b"), (0, 1200 + 1500))
+
+    def test_remove_then_set_again_never_bills_the_gap(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
+        self.tick()
+        self.quiet(xm.op_remove, 2)                              # no tick in between: works with the daemon down
+        self.panel.add_traffic("b", down=5000)
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("b", down=1000)
+        self.tick()
+        self.assertEqual(self.used("b"), (0, 5000 + 1200))
+
+    def test_detach_and_reattach_never_bills_the_gap(self):
+        mp.seed_client(self.db, "b", [1, 2])
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.detach("b", 2)
+        self.tick()
+        self.panel.add_traffic("b", down=5000)                   # direct only now: x1
+        self.panel.attach("b", 2)
+        self.tick()
+        self.panel.add_traffic("b", down=1000)
+        self.tick()
+        self.assertEqual(self.used("b"), (0, 5000 + 1200))
+
+    def test_deleted_client_is_forgotten(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.delete_client("b")
+        self.tick()
+        self.assertEqual(self.q("SELECT COUNT(*) FROM xui_mult_ledger")[0][0], 0)
+
+    def test_panel_enforces_the_quota_on_multiplied_usage(self):
+        mp.seed_client(self.db, "b", [2], total=10_000)
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("b", down=9000)                   # x1.2 = 10800 >= 10000
+        self.assertEqual(self.panel.disable_invalid(), [])
+        self.tick()
+        self.assertEqual(self.panel.disable_invalid(), ["b"])
+
+    def test_dry_run_writes_nothing(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("b", down=1000)
+        with self.assertLogs("xui-mult", "INFO") as logs:
+            self.tick(dry_run=True)
+        self.assertIn("would bill 200 B", "\n".join(logs.output))
+        self.assertEqual(self.used("b"), (0, 1000))
+
+
+class TestRobustness(Base):
+    def test_idle_ticks_write_nothing(self):
+        mp.seed_client(self.db, "b", [2])
         conn = xm.db_connect(self.db)
-        self.assertEqual(xm.account(conn, "u1", "u1_tun", 1200), (0, 0))   # history not billed
-        self.assertIsNotNone(xm.ledger_row(conn, "u1_tun"), "baseline must persist (regression)")
-        self.panel.add_traffic("u1_tun", down=1000)
-        self.assertEqual(xm.account(conn, "u1", "u1_tun", 1200), (1000, 1200))
-        conn.execute("UPDATE client_traffics SET down=300 WHERE email='u1_tun'")  # reset + new bytes
-        self.assertEqual(xm.account(conn, "u1", "u1_tun", 1200), (300, 360))
-        self.assertEqual(self.traffic("u1")[1], 1560)
+        xm.bill(conn, {2: 1.2})
+        writes = conn.total_changes
+        for _ in range(200):
+            self.assertEqual(xm.bill(conn, {2: 1.2}), ({}, []))
+        self.assertEqual(conn.total_changes, writes)
 
-    def test_remainder_carry(self):
-        mp.seed_client(self.db, "u1", [1])
-        mp.seed_client(self.db, "u1_tun", [2])
+    def test_interrupted_tick_is_atomic(self):
+        mp.seed_client(self.db, "b", [2])
         conn = xm.db_connect(self.db)
-        xm.ledger_init(conn, "u1_tun")
-        for _ in range(1000):
-            self.panel.add_traffic("u1_tun", down=3)       # 3 * 1.234 = 3.702 per tick
-            xm.account(conn, "u1", "u1_tun", 1234)
-        self.assertEqual(self.traffic("u1")[1], 3000 * 1234 // 1000)
+        xm.bill(conn, {2: 1.2})
+        self.panel.add_traffic("b", up=700, down=1000)
+        conn.execute("CREATE TRIGGER boom BEFORE UPDATE ON xui_mult_ledger "
+                     "BEGIN SELECT RAISE(ABORT, 'simulated crash'); END")
+        with self.assertRaises(sqlite3.DatabaseError):
+            xm.bill(conn, {2: 1.2})
+        self.assertEqual(self.used("b"), (700, 1000), "credit rolled back with the ledger")
+        conn.execute("DROP TRIGGER boom")
+        xm.bill(conn, {2: 1.2})
+        xm.bill(conn, {2: 1.2})
+        self.assertEqual(self.used("b"), (840, 1200), "billed exactly once")
 
-
-class TestLifecycle(Base):
-    def add(self, **kw):
-        return self.quiet(xm.op_add, "alice", 2, 1.2, assume_yes=True, **kw)
-
-    def test_add_creates_shadow_and_moves_master(self):
-        mp.seed_client(self.db, "alice", [1, 2], total=10 * GB, expiry=int(time.time() * 1000) + 86400000, limit_ip=2)
-        self.add()
-        m = self.q("SELECT id, uuid, sub_id FROM clients WHERE email='alice'")[0]
-        s = self.q("SELECT id, uuid, sub_id, total_gb, limit_ip, expiry_time FROM clients WHERE email='alice_tun'")[0]
-        self.assertEqual(m[1], s[1], "same UUID")
-        self.assertNotEqual(m[2], s[2], "unique subId (v3.8.5 rule)")
-        self.assertEqual(s[3], -(-10 * GB * 1000 // 1200), "fail-safe quota = ceil(Q/k)")
-        self.assertEqual(s[4], 2)
-        self.assertEqual([r[0] for r in self.q("SELECT inbound_id FROM client_inbounds WHERE client_id=?", (m[0],))], [1])
-        self.assertEqual([r[0] for r in self.q("SELECT inbound_id FROM client_inbounds WHERE client_id=?", (s[0],))], [2])
-        pairs = xm.load_config()["pairs"]
-        self.assertEqual(pairs, [{"master": "alice", "shadow": "alice_tun", "multiplier": 1.2, "inbound_id": 2}])
-        links = self.q("SELECT value, remark FROM client_external_links WHERE client_id=?", (m[0],))
-        self.assertEqual(len(links), 1)
-        self.assertIn("@vpn.example.com:8443", links[0][0])
-        self.assertEqual(links[0][1], "xui-mult:alice_tun")
+    def test_process_killed_mid_transaction(self):
+        mp.seed_client(self.db, "b", [2])
         conn = xm.db_connect(self.db)
-        self.assertEqual(xm.ledger_row(conn, "alice_tun")["last_down"], 0)
+        xm.bill(conn, {2: 1.2})
+        self.panel.add_traffic("b", down=5000)
+        script = textwrap.dedent(f"""
+            import os, sqlite3, sys
+            sys.path.insert(0, {os.path.dirname(HERE)!r})
+            import xui_mult as xm
+            class Dying(sqlite3.Connection):
+                def executemany(self, sql, *a):
+                    r = super().executemany(sql, *a)
+                    if sql.startswith("UPDATE client_traffics"):
+                        os._exit(9)            # no COMMIT, no ROLLBACK, no cleanup
+                    return r
+            c = sqlite3.connect({self.db!r}, isolation_level=None, factory=Dying)
+            xm.bill(c, {{2: 1.2}})
+        """)
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 9, r.stderr)
+        self.assertEqual(self.used("b"), (0, 5000), "uncommitted credit vanished")
+        xm.bill(conn, {2: 1.2})
+        self.assertEqual(self.used("b"), (0, 6000))
 
-    def test_add_rolls_back_on_failure(self):
-        mp.seed_client(self.db, "alice", [1, 2])
-        self.panel.fail_next_add = True
-        with self.assertRaises(xm.XMError):
-            self.add()
-        mid = self.q("SELECT id FROM clients WHERE email='alice'")[0][0]
-        self.assertEqual(sorted(r[0] for r in self.q("SELECT inbound_id FROM client_inbounds WHERE client_id=?",
-                                                     (mid,))), [1, 2], "master re-attached")
-        self.assertEqual(self.q("SELECT COUNT(*) FROM clients WHERE email='alice_tun'")[0][0], 0)
-        self.assertEqual(xm.load_config()["pairs"], [])
+    def test_unreadable_counters_skip_only_that_client(self):
+        for e in ("bad", "neg", "ok"):
+            mp.seed_client(self.db, e, [2])
+        self.set(2, 1.2)
+        self.tick()
+        c = sqlite3.connect(self.db)
+        c.execute("UPDATE client_traffics SET down='garbage' WHERE email='bad'")
+        c.execute("UPDATE client_traffics SET up=-500 WHERE email='neg'")
+        c.commit()
+        c.close()
+        self.panel.add_traffic("ok", down=1000.0)
+        with self.assertLogs("xui-mult", "WARNING"):
+            self.tick()
+        self.assertEqual(self.used("ok"), (0, 1200))
+        self.assertEqual(self.status()["skipped"], ["bad"])
 
-    def test_add_refuses_duplicates_and_missing(self):
-        mp.seed_client(self.db, "alice", [1])
-        with self.assertRaises(xm.XMError):
-            self.quiet(xm.op_add, "nobody", 2, 1.2, assume_yes=True)
-        self.add()
-        with self.assertRaises(xm.XMError):
-            self.add()
-        with self.assertRaises(xm.XMError):
-            self.quiet(xm.op_add, "alice", 99, 1.2, assume_yes=True)
+    def test_int64_overflow_saturates(self):
+        mp.seed_client(self.db, "b", [2])
+        conn = xm.db_connect(self.db)
+        xm.bill(conn, {2: 10})
+        self.panel.add_traffic("b", down=xm.TRAFFIC_MAX - 10)
+        per_ib, _ = xm.bill(conn, {2: 10})
+        self.assertEqual(self.used("b")[1], xm.TRAFFIC_MAX)
+        self.assertEqual(per_ib[2][1], xm.TRAFFIC_MAX - 10)
 
-    def test_daemon_depletion_renewal_and_sync(self):
-        mp.seed_client(self.db, "alice", [1], total=10_000)
-        self.add()
+    def test_locked_database_skips_the_tick_then_bills_once(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
         self.tick()
-        # 5000 direct + 4200 tunnel*1.2 = 10040 >= 10000 -> panel disables master -> daemon disables shadow
-        self.panel.add_traffic("alice", down=5000)
-        self.panel.add_traffic("alice_tun", down=4200)
+        self.panel.add_traffic("b", down=1000)
+        xm.BUSY_TIMEOUT_MS = 300
+        holder = sqlite3.connect(self.db, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")                        # the panel inside a long write
+        try:
+            t0 = time.time()
+            with self.assertLogs("xui-mult", "WARNING"):
+                self.tick()
+            self.assertLess(time.time() - t0, 5)
+            self.assertTrue(self.status()["db_busy"])
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
         self.tick()
-        self.assertEqual(self.traffic("alice")[1], 5000 + 5040)
-        self.assertEqual(self.panel.disable_invalid(), ["alice"])
         self.tick()
-        self.assertEqual(self.traffic("alice_tun")[2], 0, "shadow disabled with master")
-        # admin renews master (reset traffic + enable) -> shadow reset and re-enabled
-        self.panel.handle("POST", "/clients/resetTraffic/alice", None)
-        self.tick()
-        up, down, en, _ = self.traffic("alice_tun")
-        self.assertEqual((up, down, en), (0, 0, 1))
-        self.assertEqual(self.traffic("alice")[1], 0, "no double billing after renewal")
-        # admin raises quota + changes expiry -> mirrored to shadow (fail-safe quota recomputed)
-        exp = int(time.time() * 1000) + 5 * 86400000
-        self.panel.handle("POST", "/clients/update/alice", dict(
-            self.panel.handle("GET", "/clients/get/alice", None)[1]["client"], id=self.q(
-                "SELECT uuid FROM clients WHERE email='alice'")[0][0], totalGB=24_000, expiryTime=exp))
-        self.tick()
-        self.assertEqual(self.q("SELECT total_gb, expiry_time FROM clients WHERE email='alice_tun'")[0], (20_000, exp))
-        # traffic continues to bill after all of this
-        self.panel.add_traffic("alice_tun", up=1000)
-        self.tick()
-        self.assertEqual(self.traffic("alice")[0], 1200)
-        st = json.load(open(xm.STATUS_PATH))
-        self.assertEqual(st["api_errors"], 0)
+        self.assertEqual(self.used("b"), (0, 1200))
 
-    def test_failsafe_trip_while_master_renewed(self):
-        """Shadow depleted by its own fail-safe while master is enabled -> reset + enable."""
-        mp.seed_client(self.db, "alice", [1], total=12_000)
-        self.add()
-        self.tick()
-        self.panel.add_traffic("alice_tun", down=10_000)   # == fail-safe quota
-        self.panel.disable_invalid()
-        self.tick()
-        # master: 12000 billed -> disabled next panel tick; renewal via reset
-        self.panel.disable_invalid()
-        self.panel.handle("POST", "/clients/resetTraffic/alice", None)
-        self.tick()
-        self.assertEqual(self.traffic("alice_tun")[2], 1)
-        self.assertEqual(self.traffic("alice_tun")[1], 0)
-
-    def test_remove(self):
-        mp.seed_client(self.db, "alice", [1, 2])
-        self.add()
-        self.panel.add_traffic("alice_tun", down=1000)
-        self.quiet(xm.op_remove, "alice", delete_shadow=True, reattach=True)
-        self.assertEqual(self.traffic("alice")[1], 1200, "final billing done before delete")
-        self.assertIsNone(self.traffic("alice_tun"))
-        mid = self.q("SELECT id FROM clients WHERE email='alice'")[0][0]
-        self.assertEqual(sorted(r[0] for r in self.q("SELECT inbound_id FROM client_inbounds WHERE client_id=?",
-                                                     (mid,))), [1, 2])
-        self.assertEqual(self.q("SELECT COUNT(*) FROM client_external_links")[0][0], 0)
-        self.assertEqual(xm.load_config()["pairs"], [])
-
-    def test_set_mult_and_add_all(self):
-        for e in ("a", "b", "c"):
-            mp.seed_client(self.db, e, [1])
-        self.quiet(xm.op_add_all, 1, 2, 1.3, assume_yes=True)
-        self.assertEqual(sorted(p["shadow"] for p in xm.load_config()["pairs"]), ["a_tun", "b_tun", "c_tun"])
-        self.quiet(xm.op_add_all, 1, 2, 1.3, assume_yes=True)   # idempotent
-        self.assertEqual(len(xm.load_config()["pairs"]), 3)
-        self.quiet(xm.op_set_mult, "b", 2)
-        self.tick()
-        self.panel.add_traffic("b_tun", down=1000)
-        self.tick()
-        self.assertEqual(self.traffic("b")[1], 2000)
-
-    def test_db_replaced_reconnects(self):
-        mp.seed_client(self.db, "alice", [1])
-        self.add()
+    def test_database_replaced_reconnects(self):
+        mp.seed_client(self.db, "b", [2])
+        self.set(2, 1.2)
         self.tick()
         shutil.copy(self.db, self.db + ".bak")
-        os.replace(self.db + ".bak", self.db)       # e.g. panel "restore backup"
-        self.panel.add_traffic("alice_tun", down=500)
+        os.replace(self.db + ".bak", self.db)                     # e.g. the panel's "restore backup"
+        self.panel.add_traffic("b", down=500)
         self.tick()
-        self.assertEqual(self.traffic("alice")[1], 600)
+        self.assertEqual(self.used("b"), (0, 600))
 
-    def test_cli_read_commands(self):
-        mp.seed_client(self.db, "alice", [1], total=GB)
-        self.add()
-        self.panel.add_traffic("alice_tun", down=1000)
-        for argv in (["list"], ["dry-run"], ["inbounds"], ["status"]):
-            rc, out = self.quiet(xm.main, argv + ["--no-color"] if False else argv)
-            self.assertIn(rc, (0, 1), argv)
-            self.assertNotIn("Traceback", out)
-        _, out = self.quiet(xm.main, ["dry-run"])
-        self.assertIn("would bill", out)
-        _, out = self.quiet(xm.main, ["list"])
-        self.assertIn("alice_tun", out)
 
-    def test_bad_token_reported(self):
-        cfg = xm.load_config()
-        cfg["api_token"] = "wrong"
-        with open(xm.CONF_PATH, "w") as f:
-            json.dump(cfg, f)
-        with self.assertRaises(xm.ApiError) as e:
-            xm.api_from_config(cfg).ping()
-        self.assertIn("401", str(e.exception))
+class TestCli(Base):
+    def main(self, *argv):
+        with mock.patch("os.geteuid", return_value=0):
+            return self.quiet(xm.main, list(argv))
 
-    def test_detect_panel_url(self):
-        conn = xm.db_connect(self.db)
-        self.assertEqual(xm.detect_panel_url(conn), ("http://127.0.0.1:2053/secret", "vpn.example.com"))
+    def test_set_list_remove(self):
+        mp.seed_client(self.db, "a", [1])
+        mp.seed_client(self.db, "b", [2], enable=False)
+        rc, out = self.main("set", "2", "1.2")
+        self.assertEqual(rc, 0)
+        self.assertIn("Germany Tunnel: x1.2", out)
+        self.assertEqual(xm.load_config()["inbounds"], {2: 1.2})
+        rc, out = self.main("list")
+        row = next(line for line in out.splitlines() if "Germany Tunnel" in line)
+        self.assertIn("0/1", row)
+        self.assertIn("x1.2", row)
+        rc, out = self.main("remove", "2")
+        self.assertEqual((rc, xm.load_config()["inbounds"]), (0, {}))
+
+    def test_bad_input_is_refused(self):
+        self.assertEqual(self.main("set", "99", "1.2")[0], 1)
+        self.assertEqual(self.main("remove", "3")[0], 1)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.main("set", "2", "0.9")
+        self.assertEqual(xm.load_config()["inbounds"], {})
+
+    def test_status_reports_a_deleted_inbound(self):
+        self.main("set", "3", "1.5")
+        c = sqlite3.connect(self.db)
+        c.execute("DELETE FROM inbounds WHERE id=3")
+        c.commit()
+        c.close()
+        rc, out = self.main("status")
+        self.assertEqual(rc, 1)
+        self.assertIn("inbound #3 x1.5 no longer exists", out)
+
+    def test_menu(self):
+        mp.seed_client(self.db, "b", [2])
+        answers = iter(["1", "2", "1.3", "", "3", "2", "", "0"])
+        with mock.patch("builtins.input", lambda *_: next(answers)):
+            rc, out = self.quiet(xm.menu)
+        self.assertEqual(rc, 0)
+        self.assertIn("x1.3", out)
+        self.assertIn("inbound #2 is back to x1", out)
 
 
 if __name__ == "__main__":
