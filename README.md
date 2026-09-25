@@ -1,3 +1,11 @@
+```text
+ __  __ _   _ ___       __  __ _   _ _   _____ ___ ____  _     ___ _____ ____
+ \ \/ /| | | |_ _|     |  \/  | | | | | |_   _|_ _|  _ \| |   |_ _| ____|  _ \
+  \  / | | | || | _____| |\/| | | | | |   | |  | || |_) | |    | ||  _| | |_) |
+  /  \ | |_| || ||_____| |  | | |_| | |___| |  | ||  __/| |___ | || |___|  _ <
+ /_/\_\ \___/|___|     |_|  |_|\___/|_____|_| |___|_|   |_____|___|_____|_| \_\
+```
+
 # 3X-UI Traffic Multiplier (xui-mult)
 
 Daemon & CLI tool for inbound traffic multipliers and tunnel overhead compensation on 3X-UI (Sanaei) v3.8.5.
@@ -112,10 +120,17 @@ For exact per-inbound billing, keep tunnel users on tunnel inbounds only.
 - Python 3.9+. The installer installs `python3` with apt, dnf or yum if it is missing.
 
 ## Quick installation
-Back up the panel database first, then run as root on the panel server:
+Run both steps as root on the panel server.
+
+**Step 1: Back up your current database (recommended)**
 
 ```bash
 cp /etc/x-ui/x-ui.db /root/x-ui.db.bak
+```
+
+**Step 2: Run the installer**
+
+```bash
 bash <(curl -Ls https://raw.githubusercontent.com/mahdizo3181/-3x-ui-multiplier/main/dist/install.sh)
 ```
 
@@ -291,12 +306,23 @@ bash preflight.sh                             # all checks + build
 3X-UI برای هر کلاینت فقط **یک** شمارنده‌ی ترافیک دارد. اگر کلاینتی هم روی اینباند مستقیم و هم روی اینباند تانل باشد، **تمام** ترافیکش با ضریب حساب می‌شود، چون پنل نمی‌تواند این دو را از هم جدا کند. دستور `xui-mult list` تعداد این کلاینت‌ها را نشان می‌دهد. برای محاسبه‌ی دقیق، کاربران تانل را فقط روی اینباند تانل بگذارید.
 
 ### نصب
-اول از دیتابیس پنل نسخه‌ی پشتیبان بگیرید. بعد روی سرور، با کاربر root اجرا کنید:
+هر دو گام را روی سرور پنل و با کاربر root اجرا کنید.
+
+**گام ۱: پشتیبان‌گیری از دیتابیس فعلی (پیشنهادی)**
 
 </div>
 
 ```bash
 cp /etc/x-ui/x-ui.db /root/x-ui.db.bak
+```
+
+<div dir="rtl">
+
+**گام ۲: اجرای نصب‌کننده**
+
+</div>
+
+```bash
 bash <(curl -Ls https://raw.githubusercontent.com/mahdizo3181/-3x-ui-multiplier/main/dist/install.sh)
 ```
 
