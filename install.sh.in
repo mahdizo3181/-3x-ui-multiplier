@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # xui-mult installer — per-inbound traffic multipliers for 3X-UI (verified on v3.8.5)
+# Works with both panel databases: SQLite (default) and PostgreSQL (detected from the panel's own settings).
 # Usage:  bash install.sh            install or upgrade
 #         bash install.sh uninstall  remove (clients and their usage are not touched)
+# Environment: XUI_DB=/path/x-ui.db   pin a SQLite file in a non-default place
+#              XUI_MULT_DB=<DSN>      pin a PostgreSQL DSN (otherwise read from the panel's env file)
 set -euo pipefail
 
 VERSION="__VERSION__"
@@ -10,6 +13,7 @@ CONF_DIR=/etc/xui-mult
 UNIT=/etc/systemd/system/xui-mult.service
 BIN=/usr/local/bin/xui-mult
 XUI_DB="${XUI_DB:-/etc/x-ui/x-ui.db}"
+PANEL_ENV_FILES="${PANEL_ENV_FILES:-/etc/default/x-ui /etc/sysconfig/x-ui /etc/conf.d/x-ui}"   # loaded by the panel's systemd unit
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -19,28 +23,20 @@ die()   { red "✖ $*"; exit 1; }
 [[ $EUID -eq 0 ]] || die "run as root:  sudo bash install.sh"
 
 if [[ "${1:-}" == "uninstall" ]]; then
+  systemctl stop xui-mult 2>/dev/null || true       # stop first, so it cannot re-create the ledger
+  # the ledger is useless without the service: drop it (SQLite or PostgreSQL, whichever the panel uses)
+  if command -v python3 >/dev/null && [[ -f $APP_DIR/xui_mult.py ]]; then
+    python3 "$APP_DIR/xui_mult.py" drop-ledger 2>/dev/null || yellow "! could not drop the xui_mult_ledger table (harmless; drop it by hand if you like)"
+  fi
   systemctl disable --now xui-mult 2>/dev/null || true
   rm -f "$UNIT" "$BIN"; rm -rf "$APP_DIR" /run/xui-mult; systemctl daemon-reload || true
-  if command -v python3 >/dev/null; then   # the ledger is useless without the service
-    python3 - "$CONF_DIR/config.json" "$XUI_DB" <<'PYEOF' || true
-import json, sqlite3, sys
-try:
-    db = json.load(open(sys.argv[1])).get("db") or sys.argv[2]
-except (OSError, ValueError):
-    db = sys.argv[2]
-c = sqlite3.connect(db, timeout=10)
-c.execute("DROP TABLE IF EXISTS xui_mult_ledger")
-c.execute("DROP TABLE IF EXISTS tunnel_multiplier_ledger")   # from 1.x
-c.commit()
-PYEOF
-  fi
   green "✔ removed. Settings kept in $CONF_DIR (delete with: rm -rf $CONF_DIR)"; exit 0
 fi
 
 echo "xui-mult $VERSION installer"
 command -v systemctl >/dev/null || die "systemd is required"
 
-# --- python3 >= 3.9 (standard library only)
+# --- python3 >= 3.9 (standard library; a PostgreSQL panel also needs python3-psycopg2, installed below)
 if ! command -v python3 >/dev/null; then
   yellow "• installing python3"
   if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq python3 >/dev/null
@@ -52,8 +48,29 @@ PY=$(command -v python3)
 "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || die "python3 >= 3.9 required ($("$PY" -V))"
 "$PY" -c 'import sqlite3, ssl' 2>/dev/null || die "python3 is missing sqlite3/ssl modules"
 
-# --- 3X-UI checks
-[[ -f $XUI_DB ]] || die "3X-UI database not found at $XUI_DB (set XUI_DB=/path/x-ui.db). PostgreSQL panels are not supported."
+# --- which database does the panel use? (same files and keys the panel's own systemd unit reads)
+PANEL_DB=sqlite
+for f in $PANEL_ENV_FILES; do
+  [[ -r $f ]] && grep -qiE "^(export )?XUI_DB_TYPE=[\"']?(postgres|postgresql|pg)[\"']?[[:space:]]*$" "$f" && PANEL_DB=postgres
+done
+case "$(printf %s "${XUI_DB_TYPE:-}" | tr A-Z a-z)" in postgres|postgresql|pg) PANEL_DB=postgres ;; esac
+[[ -n ${XUI_MULT_DB:-} && ${XUI_MULT_DB} != /* ]] && PANEL_DB=postgres
+
+if [[ $PANEL_DB == postgres ]]; then
+  echo "• the panel runs on PostgreSQL"
+  if ! "$PY" -c 'import psycopg2' 2>/dev/null && ! "$PY" -c 'import psycopg' 2>/dev/null; then
+    yellow "• installing the PostgreSQL driver for python3"
+    if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq python3-psycopg2 >/dev/null
+    elif command -v dnf >/dev/null; then dnf install -y -q python3-psycopg2
+    elif command -v yum >/dev/null; then yum install -y -q python3-psycopg2
+    elif command -v pacman >/dev/null; then pacman -S --noconfirm --needed python-psycopg2 >/dev/null
+    fi || true
+    "$PY" -c 'import psycopg2' 2>/dev/null || "$PY" -c 'import psycopg' 2>/dev/null \
+      || die "the PostgreSQL driver for python3 is missing: install python3-psycopg2 (Debian/Ubuntu/RHEL) or python-psycopg2 (Arch), then run this installer again"
+  fi
+else
+  [[ -f $XUI_DB ]] || die "3X-UI database not found at $XUI_DB (set XUI_DB=/path/x-ui.db; for a PostgreSQL panel see the README)"
+fi
 PANEL_VER=$(/usr/local/x-ui/x-ui -v 2>/dev/null </dev/null | head -1 || true)
 if [[ -n $PANEL_VER && $PANEL_VER != *3.8.5* ]]; then
   yellow "! panel reports '$PANEL_VER' — xui-mult was verified on 3X-UI v3.8.5."
@@ -77,21 +94,29 @@ exec "$PY" "$APP_DIR/xui_mult.py" "\$@"
 EOF
 chmod 755 "$BIN"
 
+# "db": "auto" = follow the panel's own settings on every tick (also after `x-ui migrate-db`).
+# Only an explicit XUI_DB / XUI_MULT_DB pins a database.
 if [[ ! -f $CONF_DIR/config.json ]]; then
-  "$PY" - "$XUI_DB" "$CONF_DIR/config.json" <<'PYEOF'
+  PIN=auto
+  [[ -n ${XUI_MULT_DB:-} ]] && PIN=$XUI_MULT_DB
+  [[ $PIN == auto && $PANEL_DB == sqlite && $XUI_DB != /etc/x-ui/x-ui.db ]] && PIN=$XUI_DB
+  "$PY" - "$PIN" "$CONF_DIR/config.json" <<'PYEOF'
 import json, sys
 cfg = {"db": sys.argv[1], "interval": 7, "inbounds": {}}
 open(sys.argv[2], "w").write(json.dumps(cfg, indent=2) + "\n")
 PYEOF
 fi
-chmod 600 "$CONF_DIR/config.json"
+chmod 600 "$CONF_DIR/config.json"      # may hold a PostgreSQL password if one was pinned
+
+# --- can we reach the panel's database? Check before any service is started.
+"$PY" "$APP_DIR/xui_mult.py" db || die "cannot use the panel's database (see above). Nothing was started; fix it and run this installer again."
 
 # --- systemd service
 cat > "$UNIT" <<EOF
 [Unit]
 Description=xui-mult: per-inbound traffic multipliers for 3X-UI
 Documentation=https://github.com/mahdizo3181/-3x-ui-multiplier
-After=network-online.target x-ui.service
+After=network-online.target x-ui.service postgresql.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 

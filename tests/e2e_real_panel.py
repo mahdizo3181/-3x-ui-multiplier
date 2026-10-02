@@ -1,6 +1,9 @@
 """End-to-end run of xui-mult against a REAL 3X-UI panel binary.
 
-    python3 tests/e2e_real_panel.py /path/to/x-ui
+    python3 tests/e2e_real_panel.py /path/to/x-ui [--postgres]
+
+With --postgres the panel runs on a throwaway PostgreSQL server (XUI_DB_TYPE=postgres, as in production) and
+xui-mult finds it the way it does on a real server: from the panel's own env file.
 
 Starts the panel on 127.0.0.1 with a throwaway database in a temp dir, creates inbounds and clients
 through its API, simulates Xray's traffic reports with the panel's own atomic statement, and checks the
@@ -23,6 +26,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)
 import xui_mult as xm  # noqa: E402
 
 failures = []
@@ -41,10 +45,15 @@ def free_port():
 
 
 class Panel:
-    def __init__(self, binary, root):
-        self.bin, self.root = binary, root
+    def __init__(self, binary, root, pg=None):
+        self.bin, self.root, self.pg = binary, root, pg
         self.env = dict(os.environ, XUI_DB_FOLDER=f"{root}/db", XUI_LOG_FOLDER=f"{root}/log",
                         XUI_BIN_FOLDER=f"{root}/bin")
+        self.dsn = ""
+        if pg:
+            cluster, name = pg
+            self.dsn = cluster.dsn(name)
+            self.env.update(XUI_DB_TYPE="postgres", XUI_DB_DSN=self.dsn)
         for d in ("db", "log", "bin"):
             os.makedirs(f"{root}/{d}", exist_ok=True)
         self.port = free_port()
@@ -106,7 +115,14 @@ class Panel:
                 raise
 
     def xray_traffic(self, email, up=0, down=0):
-        """What the panel's traffic job does with Xray's stats: atomic add inside BEGIN IMMEDIATE."""
+        """What the panel's traffic job does with Xray's stats: an atomic add (inside BEGIN IMMEDIATE on SQLite)."""
+        if self.pg:
+            c = xm.pg.connect(self.dsn)
+            c.cursor().execute("UPDATE client_traffics SET up = LEAST(up + %s, 9000000000000000000), "
+                               "down = LEAST(down + %s, 9000000000000000000) WHERE email = %s", (up, down, email))
+            c.commit()
+            c.close()
+            return
         c = sqlite3.connect(self.db, timeout=10, isolation_level=None)
         c.execute("BEGIN IMMEDIATE")
         c.execute("UPDATE client_traffics SET up = MIN(up + ?, 9223372036854775807), "
@@ -115,6 +131,13 @@ class Panel:
         c.close()
 
     def row(self, email):
+        if self.pg:
+            c = xm.pg.connect(self.dsn)
+            cur = c.cursor()
+            cur.execute("SELECT up, down, enable::int FROM client_traffics WHERE email = %s", (email,))
+            r = cur.fetchone()
+            c.close()
+            return r
         c = sqlite3.connect(self.db, timeout=10)
         try:
             return c.execute("SELECT up, down, enable FROM client_traffics WHERE email=?", (email,)).fetchone()
@@ -135,16 +158,29 @@ def tick():
     xm.run_daemon(A())
 
 
-def main(binary):
+def main(binary, postgres=False):
     root = tempfile.mkdtemp(prefix="xui-mult-e2e-")
+    pg = None
+    if postgres:
+        import pgcluster
+        ok, why = pgcluster.available()
+        if not ok:
+            sys.exit("PostgreSQL e2e needs: " + why)
+        cluster = pgcluster.get()
+        pg = (cluster, cluster.new_database())
     xm.CONF_DIR, xm.RUN_DIR = f"{root}/etc", f"{root}/run"
     xm.CONF_PATH, xm.STATUS_PATH = f"{root}/etc/config.json", f"{root}/run/status.json"
     xm.C.on = False
     xm.logging.basicConfig(level=xm.logging.WARNING, format="        log: %(message)s")
-    p = Panel(binary, root)
+    p = Panel(binary, root, pg)
     p.start()
+    envfile = f"{root}/panel-env"      # what x-ui.sh / install.sh write for a PostgreSQL panel
+    if pg:
+        with open(envfile, "w") as f:
+            f.write(f"XUI_DB_TYPE=postgres\nXUI_DB_DSN={p.dsn}\n")
+        xm.PANEL_ENV_FILES = (envfile,)
     try:
-        print(f"real panel {p.cli('-v').strip()} on {p.url}  (temp dir {root})")
+        print(f"real panel {p.cli('-v').strip()} on {p.url} · {'PostgreSQL' if pg else 'SQLite'}  (temp dir {root})")
         direct = p.add_inbound("Direct", free_port())
         tun = p.add_inbound("Germany Tunnel", free_port())
         tun2 = p.add_inbound("Tunnel 2", free_port())
@@ -154,7 +190,10 @@ def main(binary):
         p.add_client("d", [tun, tun2])
         os.makedirs(xm.CONF_DIR)
         with open(xm.CONF_PATH, "w") as f:
-            json.dump(dict(xm.DEFAULT_CONFIG, db=p.db), f)
+            json.dump(dict(xm.DEFAULT_CONFIG, db="auto" if pg else p.db), f)
+        if pg:
+            t = xm.resolve_target(xm.load_config())
+            check("xui-mult finds PostgreSQL from the panel's env file", (t.kind, t.ref) == ("postgres", p.dsn), t)
 
         print("set multipliers")
         quiet(xm.op_set, tun, 1.2)
@@ -208,14 +247,22 @@ def main(binary):
 
         rc, out = quiet(xm.op_status)
         check("status runs", rc in (0, 1) and "Traceback" not in out)
+        check("status names the database", ("PostgreSQL" if pg else "SQLite") in out, out)
+        check("the DSN password never reaches the screen", not pg or "secret" not in out)
+        if pg:
+            st = json.load(open(xm.STATUS_PATH))
+            check("daemon reports its backend", st.get("backend") == "postgres" and not st.get("error"), st)
     finally:
         p.stop()
+        if pg:
+            pg[0].drop_database(pg[1])
         shutil.rmtree(root, ignore_errors=True)
     print(f"\n{'ALL E2E CHECKS PASSED' if not failures else f'{len(failures)} E2E CHECK(S) FAILED'}")
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if a != "--postgres"]
+    if len(args) != 1:
         sys.exit(__doc__)
-    sys.exit(main(os.path.abspath(sys.argv[1])))
+    sys.exit(main(os.path.abspath(args[0]), "--postgres" in sys.argv))
