@@ -39,6 +39,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import zlib
 from collections import namedtuple
 
 try:   # PostgreSQL driver: optional, only needed when the panel runs on PostgreSQL
@@ -52,7 +53,7 @@ except ImportError:
         pg, PG_DRIVER = None, None
 DB_ERRORS = (sqlite3.Error,) + ((pg.Error,) if pg else ())
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 PANEL_VERIFIED = "v3.8.5"
 SCALE = 1000                   # fixed-point multiplier: 1200 == 1.200x
 TRAFFIC_MAX = 9_000_000_000_000_000_000   # the panel's database.TrafficMax: safely below int64, so +1 delta never overflows
@@ -709,18 +710,57 @@ def inbound_row(db, inbound_id):
 
 
 def client_multipliers(db, inbound_mults):
-    """{email: (k fixed-point, inbound id)} for every client attached to a multiplied inbound.
-    A client on several multiplied inbounds pays the highest multiplier (lowest inbound id on a tie)."""
+    """{email: (k fixed-point, lowest inbound id, all inbound ids at that k)} for every client attached to a
+    multiplied inbound. A client on several multiplied inbounds pays the highest multiplier ONCE; when several
+    inbounds share that highest multiplier they all own the client (see split_share for who gets what)."""
     if not inbound_mults:
         return {}
     cond, args = db.any_of("ci.inbound_id", sorted(inbound_mults))
-    out = {}
+    best = {}
     for email, ib in db.rows(f"""SELECT c.email, ci.inbound_id FROM clients c
                                  JOIN client_inbounds ci ON ci.client_id = c.id
                                  WHERE {cond} ORDER BY ci.inbound_id""", args):
         k = mult_fp(inbound_mults[ib])
-        if email not in out or k > out[email][0]:
-            out[email] = (k, ib)
+        cur = best.get(email)
+        if cur is None or k > cur[0]:
+            best[email] = (k, [ib])
+        elif k == cur[0]:
+            cur[1].append(ib)
+    return {email: (k, ibs[0], tuple(ibs)) for email, (k, ibs) in best.items()}
+
+
+def split_share(total, ties, email):
+    """{inbound id: bytes}: `total` bytes of one client divided among the inbounds that share its multiplier.
+    The shares always add up to exactly `total`, and the few remainder bytes rotate by client (not always to the
+    lowest id), so no inbound is favoured. As `total` grows each share only ever grows, so the difference between two
+    totals is a valid, non-negative per-inbound amount. Reporting only: what the client is billed is not affected."""
+    n = len(ties)
+    if n == 1:
+        return {ties[0]: total}
+    base, rem = divmod(total, n)
+    out = dict.fromkeys(ties, base)
+    start = zlib.crc32(email.encode()) % n
+    for j in range(rem):
+        out[ties[(start + j) % n]] += 1
+    return out
+
+
+def attribute(m, email, old, new):
+    """{inbound id: bytes added} when a client's running total goes from `old` to `new`."""
+    before, after = split_share(old, m[2], email), split_share(new, m[2], email)
+    return {ib: after[ib] - before[ib] for ib in m[2]}
+
+
+def extra_by_inbound(db, inbound_mults, mults=None):
+    """{inbound id: extra bytes billed so far}, each client's total divided among the inbounds that share its
+    multiplier. The values add up to the ledger's total."""
+    mults = client_multipliers(db, inbound_mults) if mults is None else mults
+    out = {}
+    for email, e in db.rows("SELECT email, extra_total FROM xui_mult_ledger"):
+        m = mults.get(email)
+        if m:
+            for ib, v in split_share(int(e or 0), m[2], email).items():
+                out[ib] = out.get(ib, 0) + v
     return out
 
 
@@ -732,7 +772,8 @@ class Plan:
         self.first = []          # (email, up, down, now)                      first sight: baseline only
         self.moves = []          # (email, last_up, last_down, rem_up, rem_down, raw_total, extra_total, now)
         self.gone = []           # emails to forget
-        self.per_ib = {}         # {inbound id: [clients billed, raw bytes, extra bytes]}
+        self.per_ib = {}         # {inbound id: [clients billed, raw bytes, extra bytes]}; a client on several
+                                 # inbounds at its multiplier is counted on each, its bytes split between them
         self.skipped = []        # emails whose counters are unreadable
         self.tracked = 0         # clients on multiplied inbounds whose counters were read
 
@@ -775,12 +816,14 @@ def compute_plan(mults, counters, ledger, now):
         if xu or xd:
             plan.credits.append((email, xu, xd))
         # The high-water mark includes our own credit, so it is never counted as traffic.
-        plan.moves.append((email, cu + xu, cd + xd, su % SCALE, sd % SCALE,
-                           min(raw_total + du + dd, TRAFFIC_MAX), min(extra_total + xu + xd, TRAFFIC_MAX), now))
-        st = plan.per_ib.setdefault(m[1], [0, 0, 0])
-        st[0] += 1
-        st[1] += du + dd
-        st[2] += xu + xd
+        new_raw, new_extra = min(raw_total + du + dd, TRAFFIC_MAX), min(extra_total + xu + xd, TRAFFIC_MAX)
+        plan.moves.append((email, cu + xu, cd + xd, su % SCALE, sd % SCALE, new_raw, new_extra, now))
+        raw_by, extra_by = attribute(m, email, raw_total, new_raw), attribute(m, email, extra_total, new_extra)
+        for ib in m[2]:
+            st = plan.per_ib.setdefault(ib, [0, 0, 0])
+            st[0] += 1
+            st[1] += raw_by[ib]
+            st[2] += extra_by[ib]
     return plan
 
 
@@ -995,7 +1038,8 @@ def mixed_clients(db, inbound_mults, mults):
                              "JOIN client_inbounds ci ON ci.client_id = c.id"):
         m = mults.get(email)
         if m and mult_fp(inbound_mults.get(ib, 1.0)) < m[0]:
-            out.setdefault(m[1], set()).add(email)
+            for owner in m[2]:
+                out.setdefault(owner, set()).add(email)
     return {ib: len(s) for ib, s in out.items()}
 
 
@@ -1040,10 +1084,7 @@ def op_list():
     with open_db(cfg) as db:
         mults = client_multipliers(db, cfg["inbounds"])
         counts = inbound_client_counts(db)
-        extra = {}
-        for email, e in db.rows("SELECT email, extra_total FROM xui_mult_ledger"):
-            if email in mults:
-                extra[mults[email][1]] = extra.get(mults[email][1], 0) + int(e or 0)
+        extra = extra_by_inbound(db, cfg["inbounds"], mults)
         inbounds = all_inbounds(db)
         mixed = mixed_clients(db, cfg["inbounds"], mults)
     if not inbounds:

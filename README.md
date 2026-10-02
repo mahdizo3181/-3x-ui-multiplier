@@ -11,7 +11,7 @@
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/)
 [![3X-UI v3.8.5](https://img.shields.io/badge/3X--UI-v3.8.5-2ea44f.svg)](https://github.com/MHSanaei/3x-ui/releases/tag/v3.8.5)
-![Version v2.2.0](https://img.shields.io/badge/version-v2.2.0-informational.svg)
+![Version v2.2.1](https://img.shields.io/badge/version-v2.2.1-informational.svg)
 [![SQLite + PostgreSQL](https://img.shields.io/badge/database-SQLite%20%2B%20PostgreSQL-336791.svg)](#postgresql)
 [![Tests 99/99 passing](https://img.shields.io/badge/tests-99%2F99%20passing-brightgreen.svg)](tests/)
 
@@ -179,6 +179,11 @@ flowchart LR
 - **One counter per client:** 3X-UI keeps a single traffic counter per client across all its inbounds.
   A client on both a direct and a multiplied inbound therefore pays k× on **all** its traffic, and a
   client on two multiplied inbounds pays the higher one. `xui-mult list` flags these clients.
+- **Inbounds that share clients:** a client is billed **once**, however many multiplied inbounds it is on. If
+  several of them have the same (highest) multiplier, they share the credit: each client's extra bytes are
+  divided exactly among those inbounds in `EXTRA BILLED` and in the log (the few remainder bytes rotate between
+  clients, so none is favoured), and the shares always add up to what was actually billed. The shares follow the
+  current membership, so detaching a client from one of the inbounds moves its share to the others.
 
 ## Requirements
 

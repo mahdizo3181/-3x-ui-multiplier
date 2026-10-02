@@ -7,6 +7,7 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -118,6 +119,14 @@ class Base(unittest.TestCase):
         th.join()
         if errors:
             raise errors[0]
+
+    def add_inbounds(self, *ids):
+        for i in ids:
+            self.q("INSERT INTO inbounds(id, remark, protocol, port, tag, enable) VALUES (?,?,?,?,?,?)",
+                   (i, f"Tunnel {i}", "vless", 9000 + i, f"in-{i}", True))
+
+    def ledger_extra(self):
+        return int(self.q("SELECT COALESCE(SUM(extra_total), 0) FROM xui_mult_ledger")[0][0])
 
     # backend hooks used by the shared tests
     def panel_settings(self):
@@ -313,6 +322,169 @@ class BillingTests:
         self.assertIn("+600 B", out)
 
 
+class SharedClientTests:
+    """Several inbounds with the same clients (and the same multiplier): the client is billed ONCE, and every one
+    of those inbounds is credited its share. (Regression: the lowest inbound id used to take everything, so
+    `xui-mult list` and the logs showed +0 B on all the others.)"""
+    N_IB, N_CLIENTS = 4, 250
+    IDS = (2, 3, 4, 5)
+
+    def setUp(self):
+        super().setUp()
+        self.add_inbounds(4, 5)
+        self.emails = [f"s{i}" for i in range(self.N_CLIENTS)]
+        self.penv.seed_many([(e, list(self.IDS), 0, 0) for e in self.emails])
+
+    def configure(self, k, ids=IDS):
+        for i in ids:
+            self.set(i, k)
+
+    def shares(self, ids=IDS):
+        with xm.db_connect(self.db) as db:
+            got = xm.extra_by_inbound(db, {i: xm.load_config()["inbounds"][i] for i in ids})
+        return [got.get(i, 0) for i in ids]
+
+    def list_rows(self):
+        _, out = self.quiet(xm.op_list)
+        return {i: next(line for line in out.splitlines() if re.match(rf"^\W*{i}\W", line)) for i in self.IDS}, out
+
+    def test_client_is_billed_once_not_once_per_inbound(self):
+        self.configure(1.2)
+        self.tick()
+        raw = {e: (5 * (i + 1), 10 * (i + 3)) for i, e in enumerate(self.emails)}
+        self.penv.add_traffic_batch([(e, u, d) for e, (u, d) in raw.items()])
+        self.tick()
+        self.tick()                                                       # a repeat tick must not bill again
+        for e, (u, d) in raw.items():
+            self.assertEqual(self.used(e), (u + u // 5, d + d // 5), e)   # x1.2 exactly, never x1.2 per inbound
+
+    def test_every_inbound_is_credited_with_its_share(self):
+        self.configure(1.2)
+        self.tick()
+        self.penv.add_traffic_batch([(e, 5 * (i + 1), 10 * (i + 3)) for i, e in enumerate(self.emails)])
+        self.tick()
+        total = self.ledger_extra()
+        got = self.shares()
+        self.assertGreater(total, 0)
+        self.assertEqual(sum(got), total, "the shares add up to exactly what the clients were billed")
+        self.assertTrue(all(g > 0 for g in got), got)
+        mean = total / self.N_IB
+        self.assertTrue(all(abs(g - mean) <= 0.05 * mean for g in got), f"unbalanced shares {got}")
+
+    def test_list_shows_no_inbound_starved_at_zero(self):
+        self.configure(1.2)
+        self.tick()
+        self.penv.add_traffic_batch([(e, 0, 100_000) for e in self.emails])
+        self.tick()
+        rows, out = self.list_rows()
+        for i, row in rows.items():
+            self.assertIn("[1.20x]", row)
+            self.assertNotIn("+0 B", row, f"inbound #{i} starved: {row}")
+            self.assertIn(f"{self.N_CLIENTS}/{self.N_CLIENTS}", row)
+        extras = {row.split("+", 1)[1].split("│")[0].strip() for row in rows.values()}
+        self.assertLessEqual(len(extras), 2, f"shares should be (nearly) equal: {extras}")
+        self.assertIn(f"+{xm.human(self.ledger_extra() // self.N_IB)}", out)
+
+    def test_the_tick_log_reports_every_inbound(self):
+        self.configure(1.2)
+        self.tick()
+        self.penv.add_traffic_batch([(e, 0, 100_000) for e in self.emails])
+        with self.assertLogs("xui-mult", "INFO") as logs:
+            self.tick()
+        lines = [l for l in logs.output if " client(s) used " in l]
+        self.assertEqual(sorted(int(l.split("#")[1].split()[0]) for l in lines), list(self.IDS))
+        for l in lines:
+            self.assertIn(f"{self.N_CLIENTS} client(s) used", l)
+            self.assertNotIn("+0 B", l)
+        self.assertEqual(self.status()["extra_since_start"], self.ledger_extra(), "no byte logged twice")
+        self.assertEqual(self.status()["raw_since_start"], 100_000 * self.N_CLIENTS)
+
+    def test_fractional_bytes_stay_balanced_and_carry_over(self):
+        """3 bytes at x1.234 is 0.702 extra: fractions are carried per client, and what is attributed to the inbounds
+        is the exact running total, never a rounded-per-tick approximation."""
+        self.configure(1.234)
+        db = xm.db_connect(self.db)
+        cfg = {i: 1.234 for i in self.IDS}
+        xm.bill(db, cfg)
+        ticks = 100
+        for _ in range(ticks):
+            self.penv.add_traffic_batch([(e, 0, 3) for e in self.emails])
+            xm.bill(db, cfg)
+        raw = 3 * ticks
+        want = raw * 234 // 1000                                          # 70 bytes: floor(300 x 0.234)
+        for e in self.emails:
+            self.assertEqual(self.used(e), (0, raw + want), e)
+        self.assertEqual(self.ledger_extra(), want * self.N_CLIENTS)
+        got = self.shares()
+        self.assertEqual(sum(got), want * self.N_CLIENTS)
+        self.assertLessEqual(max(got) - min(got), 0.1 * min(got), got)
+
+    def test_per_tick_amounts_add_up_across_ticks(self):
+        """What the log attributes tick after tick sums to the same totals the list shows."""
+        self.configure(1.234)
+        db = xm.db_connect(self.db)
+        cfg = {i: 1.234 for i in self.IDS}
+        xm.bill(db, cfg)
+        raw, extra = dict.fromkeys(self.IDS, 0), dict.fromkeys(self.IDS, 0)
+        for t in range(40):
+            self.penv.add_traffic_batch([(e, 1, 2 + t % 3) for e in self.emails])
+            per_ib, _ = xm.bill(db, cfg)
+            for ib, (n, r, x) in per_ib.items():
+                self.assertEqual(n, self.N_CLIENTS)
+                self.assertGreaterEqual(x, 0)
+                raw[ib] += r
+                extra[ib] += x
+        self.assertEqual([extra[i] for i in self.IDS], self.shares())
+        self.assertEqual(sum(raw.values()), sum(1 + 2 + t % 3 for t in range(40)) * self.N_CLIENTS)
+
+    def test_only_the_highest_multiplier_owns_the_client(self):
+        self.set(2, 1.2)
+        self.set(3, 1.5)
+        self.set(4, 1.5)
+        self.tick()
+        self.penv.add_traffic_batch([(e, 0, 1000) for e in self.emails])
+        self.tick()
+        for e in self.emails[:3]:
+            self.assertEqual(self.used(e), (0, 1500), "billed once, at the highest multiplier")
+        got = dict(zip((2, 3, 4), self.shares((2, 3, 4))))
+        self.assertEqual(got[2], 0, "the lower multiplier is not credited")
+        self.assertEqual(got[3] + got[4], 500 * self.N_CLIENTS)
+        self.assertLessEqual(abs(got[3] - got[4]), 1 + self.N_CLIENTS // 10)
+        _, out = self.quiet(xm.op_list)
+        self.assertIn("inbound #3: 250 client(s) are also on a lower-multiplier inbound", out)
+        self.assertIn("inbound #4: 250 client(s) are also on a lower-multiplier inbound", out)
+
+    def test_leaving_one_inbound_shifts_the_shares_without_losing_a_byte(self):
+        self.configure(1.2)
+        self.tick()
+        self.penv.add_traffic_batch([(e, 0, 1000) for e in self.emails])
+        self.tick()
+        total = self.ledger_extra()
+        for e in self.emails:
+            self.panel.detach(e, 5)
+        got = self.shares((2, 3, 4))
+        self.assertEqual(sum(got), total, got)
+        self.tick()
+        self.penv.add_traffic_batch([(e, 0, 1000) for e in self.emails])
+        self.tick()
+        self.assertEqual(sum(self.shares((2, 3, 4))), self.ledger_extra())
+        self.assertEqual(self.used(self.emails[0]), (0, 2400))
+
+    def test_partly_overlapping_inbounds(self):
+        """Half the clients on #2 only, half on #2 and #3: #2 owns its own, and shares the common ones with #3."""
+        self.q("DELETE FROM client_inbounds WHERE inbound_id IN (3, 4, 5)")
+        for e in self.emails[:125]:
+            self.panel.attach(e, 3)
+        self.configure(1.2, (2, 3))
+        self.tick()
+        self.penv.add_traffic_batch([(e, 0, 1000) for e in self.emails])
+        self.tick()
+        two, three = self.shares((2, 3))
+        self.assertEqual(two + three, 200 * self.N_CLIENTS)
+        # 125 clients only on #2 (200 extra bytes each), 125 on both (100 each side)
+        self.assertEqual((two, three), (200 * 125 + 100 * 125, 100 * 125))
+
+
 class RobustnessTests:
     def test_idle_ticks_write_nothing(self):
         self.seed("b", [2])
@@ -468,6 +640,14 @@ class TestBillingSQLite(BillingTests, Base):
 
 
 class TestBillingPostgres(BillingTests, PgBase):
+    pass
+
+
+class TestSharedClientsSQLite(SharedClientTests, Base):
+    pass
+
+
+class TestSharedClientsPostgres(SharedClientTests, PgBase):
     pass
 
 
@@ -815,6 +995,35 @@ class TestPostgres(PgBase):
 
 
 # =================================================================================== choosing the database
+
+class TestSplitShare(unittest.TestCase):
+    def test_shares_always_add_up_exactly(self):
+        for n in range(1, 9):
+            ties = tuple(range(10, 10 + n))
+            for total in list(range(0, 200)) + [10 ** 6 + 3, 2 ** 40 + 7, xm.TRAFFIC_MAX]:
+                got = xm.split_share(total, ties, "someone@example")
+                self.assertEqual(sum(got.values()), total, (n, total))
+                self.assertLessEqual(max(got.values()) - min(got.values()), 1)
+
+    def test_a_share_never_shrinks_as_the_total_grows(self):
+        ties = (2, 3, 4, 5)
+        prev = xm.split_share(0, ties, "x")
+        for total in range(1, 400):
+            cur = xm.split_share(total, ties, "x")
+            self.assertTrue(all(cur[i] >= prev[i] for i in ties), total)
+            prev = cur
+
+    def test_remainder_bytes_rotate_between_clients(self):
+        ties, got = (2, 3, 4, 5), dict.fromkeys((2, 3, 4, 5), 0)
+        for i in range(2000):
+            for ib, v in xm.split_share(1, ties, f"client{i}").items():   # one byte each: who gets it?
+                got[ib] += v
+        self.assertEqual(sum(got.values()), 2000)
+        self.assertTrue(all(400 <= v <= 600 for v in got.values()), got)
+
+    def test_single_owner_gets_everything(self):
+        self.assertEqual(xm.split_share(12345, (7,), "a"), {7: 12345})
+
 
 class TestTarget(unittest.TestCase):
     def setUp(self):
