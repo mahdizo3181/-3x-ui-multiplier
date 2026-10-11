@@ -11,7 +11,7 @@
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/)
 [![3X-UI v3.8.5](https://img.shields.io/badge/3X--UI-v3.8.5-2ea44f.svg)](https://github.com/MHSanaei/3x-ui/releases/tag/v3.8.5)
-![Version v2.2.1](https://img.shields.io/badge/version-v2.2.1-informational.svg)
+![Version v2.2.2](https://img.shields.io/badge/version-v2.2.2-informational.svg)
 [![SQLite + PostgreSQL](https://img.shields.io/badge/database-SQLite%20%2B%20PostgreSQL-336791.svg)](#postgresql)
 [![Tests 99/99 passing](https://img.shields.io/badge/tests-99%2F99%20passing-brightgreen.svg)](tests/)
 
@@ -50,7 +50,7 @@ it finishes. Running the installer again upgrades in place and keeps your settin
 Run `xui-mult` to open the dashboard:
 
 ```text
-╭─ xui-mult v2.1.0 ────────────────────────────────────────────────────────╮
+╭─ xui-mult v2.2.2 ────────────────────────────────────────────────────────╮
 │ Inbound traffic multipliers for 3X-UI                                    │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ Service      ● running              Last tick    3s ago                  │
@@ -176,6 +176,13 @@ flowchart LR
   locks on PostgreSQL). It uses the panel's own `up = MIN(up + ?, max)` update and advances a high-water-mark
   ledger (`xui_mult_ledger`, in the panel's own database) in the same commit. It can't race the panel,
   bills nothing twice, and a crash rolls the whole tick back.
+- **Counters that go down:** a reset, a renewal, the API's `updateTraffic`, a restored backup: the new value is
+  followed and nothing is billed for it (traffic between a reset and the next tick is billed at 1×).
+- **Counters that jump up:** a counter that grows faster than any link could carry, `max_mbps` (default 1000
+  Mbit/s per client and direction, in `/etc/xui-mult/config.json`; `0` turns it off), was rewritten, not used:
+  an admin raising usage, an import that restores counters after creating the row. It is followed, not billed,
+  and logged as a warning. The window is the time since the last tick, so after downtime the daemon still bills
+  what was used meanwhile. Below the limit a rewrite can't be told from traffic and is billed.
 - **One counter per client:** 3X-UI keeps a single traffic counter per client across all its inbounds.
   A client on both a direct and a multiplied inbound therefore pays k× on **all** its traffic, and a
   client on two multiplied inbounds pays the higher one. `xui-mult list` flags these clients.
@@ -195,7 +202,7 @@ flowchart LR
 ## Testing
 
 ```bash
-bash preflight.sh                  # unit + scale tests on SQLite and PostgreSQL, build, installer == tested source
+bash preflight.sh                  # unit, edge-case + scale tests on SQLite and PostgreSQL, build, installer == tested source
 bash preflight.sh --bench          # tick time / statements / memory against client count
 bash preflight.sh --real-panel     # end to end against a real v3.8.5 panel, on SQLite and on PostgreSQL
 bash preflight.sh --db <file|DSN>  # compatibility of your own database (SQLite: on a copy; PostgreSQL: read-only)
@@ -205,6 +212,11 @@ PostgreSQL tests start a throwaway local server (`initdb`, listening on 127.0.0.
 if no server binaries or driver are available. They include 600+ clients per inbound, a panel writing rows in
 random order while we bill (no deadlocks), two billers racing, a killed connection, a PostgreSQL restart,
 and a migration from SQLite to PostgreSQL while the daemon runs.
+
+`tests/test_edge_cases.py` runs on both databases: counters lowered or raised from outside, resets of every
+client, 50 idle ticks with zero drift, mixed and shared multipliers with exact fractions, multipliers changed
+under load, 8 panel writers racing the daemon (SKIP LOCKED exercised on PostgreSQL), a daemon process SIGKILLed
+at random moments, thousands of tiny requests, terabyte counters and the int64 cap.
 
 ## Uninstall
 

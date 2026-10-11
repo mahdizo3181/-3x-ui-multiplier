@@ -1,6 +1,7 @@
 """Stand-in for what xui-mult touches in a 3X-UI v3.8.5 database (same tables, columns and indexes, on SQLite
-and on PostgreSQL), plus the panel's own writes to those rows: the atomic traffic add, the traffic reset and
-the depleted-client disable job. xui-mult never calls the panel API, so no HTTP server is needed.
+and on PostgreSQL), plus the panel's own writes to those rows: the atomic traffic add, the traffic reset, the
+API's absolute traffic set and the depleted-client disable job. xui-mult never calls the panel API, so no HTTP
+server is needed.
 
 `make_env("sqlite" | "postgres", tmp)` returns an Env with one interface for both, so a test is written once.
 The PostgreSQL schema was dumped from a real v3.8.5 panel running on PostgreSQL (see tests/e2e_real_panel.py)."""
@@ -79,6 +80,14 @@ class Panel:
         """resetClientTraffic: zero the counters and re-enable."""
         self._tx(("UPDATE client_traffics SET up=0, down=0, enable=1 WHERE email=?", (email,)),
                  ("UPDATE clients SET enable=1 WHERE email=?", (email,)))
+
+    def set_traffic(self, email, up, down):
+        """UpdateClientTrafficByEmail (POST /panel/api/clients/updateTraffic/:email): absolute values, not a delta."""
+        self._tx(("UPDATE client_traffics SET up=?, down=? WHERE email=?", (up, down, email)))
+
+    def reset_all_traffic(self):
+        """ResetAllClientTraffics: every client's counters to zero, and re-enabled."""
+        self._tx(("UPDATE client_traffics SET up=0, down=0, enable=1", ()), ("UPDATE clients SET enable=1", ()))
 
     def disable_invalid(self):
         """disableInvalidClients (depletedClientsCondLocal): quota used up or expired -> disabled."""
@@ -185,6 +194,12 @@ class PgPanel:
     def reset_traffic(self, email):
         self._tx(("UPDATE client_traffics SET up=0, down=0, enable=true WHERE email=?", (email,)),
                  ("UPDATE clients SET enable=true WHERE email=?", (email,)))
+
+    def set_traffic(self, email, up, down):
+        self._tx(("UPDATE client_traffics SET up=?, down=? WHERE email=?", (up, down, email)))
+
+    def reset_all_traffic(self):
+        self._tx(("UPDATE client_traffics SET up=0, down=0, enable=true", ()), ("UPDATE clients SET enable=true", ()))
 
     def disable_invalid(self):
         now = int(time.time() * 1000)

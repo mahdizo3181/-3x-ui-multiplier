@@ -14,7 +14,9 @@ x-ui.db, so the panel's own quota and expiry enforcement does the rest. Nothing 
   * billing    : one transaction per tick, a handful of set-based statements whatever the client count:
                  `up = MIN(up + ?, cap)` (the panel's own atomic form) + a high-water-mark ledger in the
                  panel's database, committed together. Fractions carry over, so extra == floor(raw x (k - 1))
-                 exactly. A tick with nothing to bill takes no lock and writes nothing.
+                 exactly. A tick with nothing to bill takes no lock and writes nothing. A counter that goes
+                 down (reset, API rewrite, restored backup), or up faster than max_mbps (a rewrite, an import),
+                 is followed, never billed.
   * databases  : SQLite and PostgreSQL, detected from the panel's own settings (XUI_DB_TYPE / XUI_DB_DSN).
                  On PostgreSQL the rows being billed are locked with FOR UPDATE SKIP LOCKED, so the daemon
                  never waits on, and can never deadlock with, the panel.
@@ -53,7 +55,7 @@ except ImportError:
         pg, PG_DRIVER = None, None
 DB_ERRORS = (sqlite3.Error,) + ((pg.Error,) if pg else ())
 
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 PANEL_VERIFIED = "v3.8.5"
 SCALE = 1000                   # fixed-point multiplier: 1200 == 1.200x
 TRAFFIC_MAX = 9_000_000_000_000_000_000   # the panel's database.TrafficMax: safely below int64, so +1 delta never overflows
@@ -77,6 +79,7 @@ DEFAULT_CONFIG = {
     "db": "auto",           # "auto" (follow the panel), a SQLite file path, or a PostgreSQL DSN
 
     "interval": 7,
+    "max_mbps": 1000,       # per client and direction: a counter moving faster than this was rewritten, not used
     "inbounds": {},         # {"<inbound id>": multiplier}
 }
 
@@ -325,6 +328,8 @@ def load_config():
         raise XMError(f"config: inbounds: {e}")
     if float(cfg.get("interval", 7)) < 2:
         raise XMError("config: interval must be >= 2 seconds")
+    if float(cfg.get("max_mbps", 0)) < 0:
+        raise XMError("config: max_mbps must be >= 0 (0 = no limit)")
     if not isinstance(cfg.get("db"), str) or not cfg["db"].strip():
         raise XMError('config: "db" must be "auto", a SQLite file path or a PostgreSQL DSN')
     return cfg
@@ -445,6 +450,7 @@ class Database:
         self.conn, self.ref = conn, ref
         self.stmts = 0      # statements sent to the server (an executemany counts once)
         self.last = {"clients": 0, "statements": 0}
+        self.synced_at = None   # end of the last tick that left the ledger matching the counters
 
     def __enter__(self):
         return self
@@ -477,7 +483,8 @@ class Database:
 
     def ledger(self):
         return {r[0]: tuple(r[1:]) for r in self.rows(
-            "SELECT email, last_up, last_down, rem_up, rem_down, raw_total, extra_total FROM xui_mult_ledger")}
+            "SELECT email, last_up, last_down, rem_up, rem_down, raw_total, extra_total, updated_at "
+            "FROM xui_mult_ledger")}
 
     def apply(self, plan):
         self.credit(plan.credits)
@@ -775,6 +782,8 @@ class Plan:
         self.per_ib = {}         # {inbound id: [clients billed, raw bytes, extra bytes]}; a client on several
                                  # inbounds at its multiplier is counted on each, its bytes split between them
         self.skipped = []        # emails whose counters are unreadable
+        self.dropped = []        # emails whose counters went down to a non-zero value: followed, not billed
+        self.jumped = []         # "email (+bytes in s)": moved faster than max_mbps: followed, not billed
         self.tracked = 0         # clients on multiplied inbounds whose counters were read
 
     @property
@@ -782,8 +791,10 @@ class Plan:
         return bool(self.credits or self.first or self.moves or self.gone)
 
 
-def compute_plan(mults, counters, ledger, now):
-    """Pure function of what was read: no I/O, so it is the same for every database."""
+def compute_plan(mults, counters, ledger, now, synced_at=None, max_bps=0):
+    """Pure function of what was read: no I/O, so it is the same for every database. `synced_at`: when the counters
+    last matched the ledger (the previous clean tick of this connection); `max_bps`: the fastest a counter can move
+    in either direction, in bytes/s (0: no limit)."""
     plan = Plan()
     # Detached, deleted or no longer multiplied: forget the client, so a later re-attach starts from its
     # counters at that moment instead of billing everything used in between.
@@ -802,13 +813,27 @@ def compute_plan(mults, counters, ledger, now):
         if led is None:
             plan.first.append((email, cu, cd, now))   # first sight: never bill traffic from before
             continue
-        last_up, last_down, rem_up, rem_down, raw_total, extra_total = led
-        # A counter that went DOWN was reset (renewal / manual reset): all of it is new traffic.
-        du = cu - last_up if cu >= last_up else cu
-        dd = cd - last_down if cd >= last_down else cd
+        last_up, last_down, rem_up, rem_down, raw_total, extra_total, updated_at = led
+        # A counter that went DOWN was rewritten outside the traffic path: a reset or renewal, but also the API's
+        # updateTraffic, a restored backup, a tool writing back a value it read before our credit. What it holds
+        # now is not new traffic, so follow it and bill nothing (billing it charged (k - 1) x the client's WHOLE
+        # usage for any dip). The cost: traffic between a reset and our next tick is billed x1.
+        if cu < last_up or cd < last_down:
+            if cu or cd:
+                plan.dropped.append(email)
+            plan.moves.append((email, cu, cd, rem_up, rem_down, raw_total, extra_total, now))
+            continue
+        du, dd = cu - last_up, cd - last_down
         if du == 0 and dd == 0:
-            if (cu, cd) != (last_up, last_down):   # reset to zero: follow it
-                plan.moves.append((email, cu, cd, rem_up, rem_down, raw_total, extra_total, now))
+            continue
+        # Faster than any link: rewritten UPWARD (the API's updateTraffic, an import that creates the row at 0 and
+        # restores its counters after), not used. Follow it, bill nothing. The traffic dates from the later of the
+        # ledger's last move and the last clean tick; with neither recent (first tick after downtime) the window is
+        # long and catching up is billed.
+        secs = max(now - max(updated_at, synced_at or 0), 1)
+        if max_bps and max(du, dd) > max_bps * secs:
+            plan.jumped.append(f"{email} (+{human(du + dd)} in {secs} s)")
+            plan.moves.append((email, cu, cd, rem_up, rem_down, raw_total, extra_total, now))
             continue
         su, sd = du * (m[0] - SCALE) + rem_up, dd * (m[0] - SCALE) + rem_down
         # Never past the cap: the panel stores the counters as int64, and PostgreSQL errors on overflow.
@@ -827,13 +852,13 @@ def compute_plan(mults, counters, ledger, now):
     return plan
 
 
-def read_plan(db, inbound_mults, now, lock):
+def read_plan(db, inbound_mults, now, lock, max_bps):
     mults = client_multipliers(db, inbound_mults)
     counters = db.counters(sorted(inbound_mults), lock) if mults else {}
-    return compute_plan(mults, counters, db.ledger(), now)
+    return compute_plan(mults, counters, db.ledger(), now, db.synced_at, max_bps)
 
 
-def bill(db, inbound_mults, dry_run=False):
+def bill(db, inbound_mults, dry_run=False, max_mbps=DEFAULT_CONFIG["max_mbps"]):
     """One tick: add floor(new traffic x (k - 1)) to each client's own counters and advance the ledger,
     in ONE transaction. Returns ({inbound id: [clients, raw, extra]}, [emails skipped: unreadable counters]).
 
@@ -841,18 +866,26 @@ def bill(db, inbound_mults, dry_run=False):
     nothing and held nothing. Only if there is something to bill do we open the transaction, re-read the
     counters under their row locks (so the panel cannot slip an update between our read and our write),
     and write the whole tick in a few set-based statements."""
-    now, before = int(time.time()), db.stmts
-    plan = read_plan(db, inbound_mults, now, lock=False)
+    now, before, max_bps = int(time.time()), db.stmts, int(float(max_mbps) * 125_000)   # Mbit/s -> bytes/s
+    plan = read_plan(db, inbound_mults, now, False, max_bps)
     if plan.work and not dry_run:
         db.begin()
         try:
-            plan = read_plan(db, inbound_mults, now, lock=True)
+            plan = read_plan(db, inbound_mults, now, True, max_bps)
             if plan.work:
                 db.apply(plan)
             db.commit()
         except BaseException:
             db.rollback()
             raise
+    if not (plan.work and dry_run):
+        db.synced_at = now
+    if plan.dropped:
+        log.info("counter went down (reset with traffic since, or rewritten outside the panel's traffic path), "
+                 "followed without billing: %s", ", ".join(sorted(plan.dropped)))
+    if plan.jumped:
+        log.warning("counter jumped faster than max_mbps (%s Mbit/s): rewritten outside the panel's traffic path, "
+                    "followed without billing: %s", max_mbps, ", ".join(sorted(plan.jumped)))
     db.last = {"clients": plan.tracked, "statements": db.stmts - before}
     return plan.per_ib, plan.skipped
 
@@ -957,7 +990,7 @@ def run_daemon(args):
 
         if db is not None:   # also with no multiplied inbound: bill() forgets clients that left
             try:
-                per_ib, skipped = bill(db, cfg["inbounds"], args.dry_run)
+                per_ib, skipped = bill(db, cfg["inbounds"], args.dry_run, cfg["max_mbps"])
                 if per_ib:
                     names = dict(db.rows("SELECT id, remark FROM inbounds"))
                     for ib, (n, raw, extra) in sorted(per_ib.items()):

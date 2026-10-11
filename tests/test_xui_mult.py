@@ -84,11 +84,12 @@ class Base(unittest.TestCase):
     def run_daemon_with(self, script, timeout=60):
         """Run the real daemon loop (50 ms interval) in this thread while `script(wait_ticks)` runs in another and
         may change things between ticks. The daemon stops when the script returns."""
-        real, ticks, errors = xm.load_config, [0], []
+        real, ticks, errors, me = xm.load_config, [0], [], threading.current_thread()
 
         def fast():
             cfg = real()
-            cfg["interval"] = 0.05
+            if threading.current_thread() is me:     # the daemon only: a CLI call in the script would save it
+                cfg["interval"] = 0.05
             return cfg
 
         def notify(msg):
@@ -247,6 +248,26 @@ class BillingTests:
         self.tick()
         self.assertEqual(self.used("b"), (0, 600))
 
+    def test_counter_lowered_from_outside_is_not_billed_as_traffic(self):
+        """The phantom drain. Something other than the traffic path writes a client's counter to a LOWER value that
+        is not zero: the panel's POST /panel/api/clients/updateTraffic/:email, a restored backup, a bot that read the
+        counter before our credit and writes it back after. That used to count as a reset, so the WHOLE counter was
+        billed again as new traffic: 0.2 x 25 GB = 5 GB for a 200-byte dip, on a client using nothing."""
+        gb = 1 << 30
+        self.seed("b", [2], down=25 * gb)                        # used before the multiplier was set
+        self.set(2, 1.2)
+        self.tick()
+        self.panel.add_traffic("b", down=1000)
+        seen = self.used("b")                                    # a bot reads the counter...
+        self.tick()                                              # ...we credit +200...
+        self.panel.set_traffic("b", *seen)                       # ...it writes back what it read: our +200 is gone
+        for _ in range(10):
+            self.tick()
+        self.assertEqual(self.used("b"), seen)
+        self.panel.add_traffic("b", down=1000)                   # billing carries on from the rewritten value
+        self.tick()
+        self.assertEqual(self.used("b"), (0, seen[1] + 1200))
+
     def test_changing_the_multiplier_applies_to_new_traffic(self):
         self.seed("b", [2])
         self.set(2, 1.2)
@@ -357,6 +378,20 @@ class SharedClientTests:
         self.tick()                                                       # a repeat tick must not bill again
         for e, (u, d) in raw.items():
             self.assertEqual(self.used(e), (u + u // 5, d + d // 5), e)   # x1.2 exactly, never x1.2 per inbound
+
+    def test_idle_clients_stay_put_for_ten_ticks(self):
+        """Our own credit is never read back as traffic: the ledger's high-water mark includes it, so a tick with no
+        new traffic bills nothing, for a client on 4 multiplied inbounds too."""
+        self.configure(1.2)
+        self.tick()
+        self.penv.add_traffic_batch([(e, 100, 1000) for e in self.emails])
+        self.tick()
+        billed = {e: self.used(e) for e in self.emails}
+        self.assertEqual(set(billed.values()), {(120, 1200)})
+        for _ in range(10):
+            self.tick()
+        self.assertEqual({e: self.used(e) for e in self.emails}, billed)
+        self.assertEqual(self.ledger_extra(), self.N_CLIENTS * 220)
 
     def test_every_inbound_is_credited_with_its_share(self):
         self.configure(1.2)
@@ -537,11 +572,11 @@ class RobustnessTests:
         db = xm.db_connect(self.db)
         xm.bill(db, {2: 10})
         self.panel.add_traffic("b", down=xm.TRAFFIC_MAX - 10)
-        per_ib, _ = xm.bill(db, {2: 10})
+        per_ib, _ = xm.bill(db, {2: 10}, max_mbps=0)              # 9e18 bytes in a second: only with no rate limit
         self.assertEqual(self.used("b")[1], xm.TRAFFIC_MAX)
         self.assertEqual(per_ib[2][1], xm.TRAFFIC_MAX - 10)
         self.panel.add_traffic("b", down=10 ** 15)                # already at the cap: stays there, nothing breaks
-        xm.bill(db, {2: 10})
+        xm.bill(db, {2: 10}, max_mbps=0)
         self.assertLessEqual(self.used("b")[1], 2 ** 63 - 1)
 
     def test_read_only_connection_creates_nothing_and_writes_nothing(self):

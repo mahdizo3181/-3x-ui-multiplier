@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pre-flight checks before deploying xui-mult. Runs locally and only writes to dist/ and temp dirs.
-#   bash preflight.sh                       syntax, unit + scale tests (SQLite, and PostgreSQL when a server is
-#                                           installed), build, installer payload == tested source
+#   bash preflight.sh                       syntax, unit + edge-case + scale tests (SQLite, and PostgreSQL when a
+#                                           server is installed), build, installer payload == tested source
 #   bash preflight.sh --db ./x-ui.db        + compatibility check on a COPY of your production SQLite database
 #   bash preflight.sh --db 'postgres://…'   + READ-ONLY compatibility check of a live PostgreSQL panel
 #   bash preflight.sh --bench               + tick time / statements / memory against client count
@@ -60,6 +60,9 @@ echo "$PG_NOTE"
 
 step "unit tests (mock of the v3.8.5 panel; every behaviour on SQLite and on PostgreSQL)"
 "$PYT" -W ignore::ResourceWarning -m unittest discover -s tests -p 'test_xui_mult.py'
+
+step "edge cases & stress (rewritten counters, resets, idle drift, topologies, concurrency, kills, boundaries)"
+"$PYT" -W ignore::ResourceWarning -m unittest discover -s tests -p 'test_edge_cases.py'
 
 step "scale tests (1100 multiplied clients of 3000: exactness, statements per tick, idle cost, memory)"
 "$PYT" -W ignore::ResourceWarning -m unittest discover -s tests -p 'test_scale.py'
